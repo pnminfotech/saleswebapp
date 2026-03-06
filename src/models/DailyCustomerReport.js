@@ -30,6 +30,17 @@ const dailyCustomerReportSchema = new mongoose.Schema(
       accuracy: { type: Number, default: null },
       capturedAt: { type: Date, default: null }
     },
+    locationTrail: {
+      type: [
+        {
+          lat: { type: Number, required: true },
+          lng: { type: Number, required: true },
+          accuracy: { type: Number, default: null },
+          capturedAt: { type: Date, required: true }
+        }
+      ],
+      default: []
+    },
 
     rows: { type: [rowSchema], default: [] },
 

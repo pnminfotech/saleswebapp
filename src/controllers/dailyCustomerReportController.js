@@ -10,7 +10,7 @@ function isValidDateKey(s) {
 exports.upsertMyDailyReport = async (req, res) => {
   try {
     const userId = req.user.id;
-    const { reportDateKey, openingKm, closingKm, rows, startLocation } = req.body;
+    const { reportDateKey, openingKm, closingKm, rows, startLocation, locationTrail } = req.body;
 
     if (!isValidDateKey(reportDateKey)) {
       return res.status(400).json({ message: "reportDateKey must be YYYY-MM-DD" });
@@ -70,15 +70,38 @@ for (const n of newNames) {
       }
     }
 
+    let cleanLocationTrail = [];
+    if (Array.isArray(locationTrail)) {
+      cleanLocationTrail = locationTrail
+        .map((p) => {
+          const lat = Number(p?.lat);
+          const lng = Number(p?.lng);
+          if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+          if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+          return {
+            lat,
+            lng,
+            accuracy: Number.isFinite(Number(p?.accuracy)) ? Number(p.accuracy) : null,
+            capturedAt: p?.capturedAt ? new Date(p.capturedAt) : new Date()
+          };
+        })
+        .filter(Boolean)
+        .slice(-1000);
+    }
+
+    const setObj = {
+      openingKm: open,
+      closingKm: close,
+      rows: cleanedRows,
+    };
+
+    if (cleanStartLocation) setObj.startLocation = cleanStartLocation;
+    if (Array.isArray(locationTrail)) setObj.locationTrail = cleanLocationTrail;
+
     const doc = await DailyCustomerReport.findOneAndUpdate(
       { userId, reportDateKey },
       {
-        $set: {
-          openingKm: open,
-          closingKm: close,
-          startLocation: cleanStartLocation,
-          rows: cleanedRows,
-        },
+        $set: setObj,
       },
       { new: true, upsert: true }
     );
@@ -177,7 +200,7 @@ exports.adminListDailyReportsRange = async (req, res) => {
     }
 
     const list = await DailyCustomerReport.find(filter)
-      .select("userId reportDateKey openingKm closingKm startLocation rows")
+      .select("userId reportDateKey openingKm closingKm startLocation locationTrail rows")
       .sort({ reportDateKey: -1 })
       .limit(safeLimit)
       .populate("userId", "name email")
@@ -223,6 +246,14 @@ exports.adminListDailyReportsRange = async (req, res) => {
         openingKm: r.openingKm,
         closingKm: r.closingKm,
         startLocation: r.startLocation || null,
+        locationTrail: Array.isArray(r.locationTrail)
+          ? r.locationTrail.map((p) => ({
+              lat: Number(p?.lat),
+              lng: Number(p?.lng),
+              accuracy: Number(p?.accuracy || 0),
+              capturedAt: p?.capturedAt || null,
+            }))
+          : [],
         netKm,
         rowsCount: rows.length,
         orderSum,
@@ -282,7 +313,7 @@ exports.adminExportDailyReportsCSV = async (req, res) => {
     }
 
     const list = await DailyCustomerReport.find(filter)
-      .select("userId reportDateKey openingKm closingKm startLocation rows")
+      .select("userId reportDateKey openingKm closingKm startLocation locationTrail rows")
       .sort({ reportDateKey: -1 })
       .limit(2000)
       .lean();
@@ -298,6 +329,7 @@ exports.adminExportDailyReportsCSV = async (req, res) => {
       "startLng",
       "startAccuracy",
       "startCapturedAt",
+      "trackPoints",
       "customerName",
       "newOrExisting",
       "area",
@@ -321,6 +353,7 @@ exports.adminExportDailyReportsCSV = async (req, res) => {
       const startCapturedAt = r?.startLocation?.capturedAt
         ? new Date(r.startLocation.capturedAt).toISOString()
         : "";
+      const trackPoints = Array.isArray(r?.locationTrail) ? r.locationTrail.length : 0;
       const items = Array.isArray(r.rows) ? r.rows : [];
 
       if (!items.length) {
@@ -336,6 +369,7 @@ exports.adminExportDailyReportsCSV = async (req, res) => {
             Number.isFinite(startLng) ? startLng : "",
             Number.isFinite(startAccuracy) ? startAccuracy : "",
             startCapturedAt,
+            trackPoints,
             "", "", "", "", "", "", "", ""
           ].join(",")
         );
@@ -360,6 +394,7 @@ exports.adminExportDailyReportsCSV = async (req, res) => {
             Number.isFinite(startLng) ? startLng : "",
             Number.isFinite(startAccuracy) ? startAccuracy : "",
             safe(startCapturedAt),
+            trackPoints,
             safe(it.customerName),
             safe(it.newOrExisting),
             safe(it.area),

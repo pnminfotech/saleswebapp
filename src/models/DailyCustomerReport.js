@@ -8,9 +8,12 @@ const rowSchema = new mongoose.Schema(
     metTo: { type: String, trim: true }, // Mr/Mrs/Miss
     designation: { type: String, trim: true },
     enquiryMode: { type: String, trim: true },
-    orderGenerated: { type: Number, default: 0 }, // ₹
+    orderGenerated: { type: Number, default: 0 }, // Order Generated → Potential orders
     segment: { type: String, trim: true },
-    poReceived: { type: Number, default: 0 }, // ₹
+    salesInvoiced: { type: Number, default: 0 }, // Sales → Invoice amount (bills generated)
+    salesInvoiceDate: { type: String, trim: true, default: "" }, // YYYY-MM-DD
+    poReceived: { type: Number, default: 0 }, // Collection → Money received
+    collectionDate: { type: String, trim: true, default: "" }, // YYYY-MM-DD
   },
   { _id: true }
 );

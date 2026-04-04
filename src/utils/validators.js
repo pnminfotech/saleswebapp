@@ -35,6 +35,7 @@ const adminResetPasswordSchema = z.object({
 
 const upsertTargetSchema = z.object({
   userId: z.string().min(10),
+  segmentId: z.string().min(10),
   periodType: z.enum(["MONTH", "QUARTER", "YEAR"]),
   periodKey: z.string().min(3),
   vendorVisitTarget: z.number().optional(),

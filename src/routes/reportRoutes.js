@@ -78,10 +78,12 @@ const router = require("express").Router();
 const mongoose = require("mongoose");
 
 const DailyCustomerReport = require("../models/DailyCustomerReport");
-const Target = require("../models/Target");
+const Customer = require("../models/Customer");
+const Segment = require("../models/Segment");
 const authModule = require("../middleware/auth");
 const { requireRole } = require("../middleware/requireRole");
 const reportController = require("../controllers/reportController");
+const { resolveTargetRows, summarizeTargetRows } = require("../utils/targetRollup");
 
 const auth = typeof authModule === "function" ? authModule : authModule.auth;
 
@@ -89,6 +91,8 @@ const auth = typeof authModule === "function" ? authModule : authModule.auth;
 router.get("/performance", auth, requireRole("admin"), reportController.adminPerformanceReport);
 router.get("/customerwise", auth, requireRole("admin"), reportController.adminCustomerWiseReport);
 router.get("/lead-conversion", auth, requireRole("admin"), reportController.adminLeadConversionReport);
+router.get("/segment-wise", auth, requireRole("admin"), reportController.adminSegmentWiseSalesReport);
+router.get("/segment-wise/customerwise", auth, requireRole("admin"), reportController.adminSegmentWiseCustomerReport);
 router.get("/customer-tracker/me", auth, requireRole("sales"), reportController.myCustomerCollectionTracker);
 
 function monthRange(yyyyMM) {
@@ -150,6 +154,34 @@ function periodToRange(periodType, periodKey) {
   return yearRange(periodKey);
 }
 
+function normalizeSegmentKey(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function toTitleCase(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/\b\w/g, (ch) => ch.toUpperCase());
+}
+
+async function buildCustomerSegmentLookup() {
+  const customers = await Customer.find({}).select("name segment area").lean();
+  const map = new Map();
+
+  for (const customer of customers) {
+    const key = normalizeSegmentKey(customer?.name);
+    if (!key || map.has(key)) continue;
+    map.set(key, {
+      segment: String(customer?.segment || "").trim(),
+      area: String(customer?.area || "").trim(),
+    });
+  }
+
+  return map;
+}
+
 router.get("/performance/me", auth, async (req, res) => {
   try {
     const { periodType, periodKey } = req.query;
@@ -159,9 +191,8 @@ router.get("/performance/me", auth, async (req, res) => {
 
     const userId = req.user.id;
     const userObjId = new mongoose.Types.ObjectId(userId);
-
-    // 1) target from Target collection (this part is correct)
-    const target = await Target.findOne({ userId, periodType, periodKey }).lean();
+    const targetRows = await resolveTargetRows({ periodType, periodKey, userId });
+    const target = summarizeTargetRows(targetRows);
 
     // 2) date range from periodType/key
     const { startKey, endKey } = periodToRange(periodType, periodKey);
@@ -202,12 +233,12 @@ router.get("/performance/me", auth, async (req, res) => {
           },
 
           // sum of row amounts (adjust keys to your row schema)
-          sales: {
+          salesInvoiced: {
             $sum: {
               $map: {
                 input: { $ifNull: ["$rows", []] },
                 as: "r",
-                in: { $ifNull: ["$$r.orderGenerated", 0] }, // your UI shows "Order Generated"
+                in: { $ifNull: ["$$r.salesInvoiced", 0] },
               },
             },
           },
@@ -240,7 +271,7 @@ router.get("/performance/me", auth, async (req, res) => {
           runningKm: { $sum: "$runningKm" },
           vendorsVisited: { $sum: "$vendorsVisited" },
           newVendorsAdded: { $sum: "$newVendorsAdded" },
-          sales: { $sum: "$sales" },
+          salesInvoiced: { $sum: "$salesInvoiced" },
           collection: { $sum: "$collection" },
           poReceived: { $sum: "$poReceived" },
         },
@@ -251,15 +282,224 @@ router.get("/performance/me", auth, async (req, res) => {
       runningKm: 0,
       vendorsVisited: 0,
       newVendorsAdded: 0,
+      salesInvoiced: 0,
       sales: 0,
       collection: 0,
       poReceived: 0,
     };
 
+    actual.sales = actual.salesInvoiced;
+
     return res.json({ target: target || null, actual });
   } catch (err) {
     console.error("performance/me error:", err);
     res.status(500).json({ message: err.message || "Server error" });
+  }
+});
+
+router.get("/performance/me/segments", auth, async (req, res) => {
+  try {
+    const { periodType, periodKey } = req.query;
+    if (!periodType || !periodKey) {
+      return res.status(400).json({ message: "periodType and periodKey are required" });
+    }
+
+    const userId = req.user.id;
+    const { startKey, endKey } = periodToRange(periodType, periodKey);
+    const customerLookup = await buildCustomerSegmentLookup();
+    const targetRows = await resolveTargetRows({ periodType, periodKey, userId });
+
+    const actualRows = await DailyCustomerReport.aggregate([
+        {
+          $match: {
+            userId: new mongoose.Types.ObjectId(userId),
+            reportDateKey: { $gte: startKey, $lt: endKey },
+          },
+        },
+        { $unwind: { path: "$rows", preserveNullAndEmptyArrays: true } },
+        {
+          $project: {
+            customerName: {
+              $trim: {
+                input: { $ifNull: ["$rows.customerName", ""] },
+              },
+            },
+            segmentName: {
+              $trim: {
+                input: { $ifNull: ["$rows.segment", ""] },
+              },
+            },
+            area: {
+              $trim: {
+                input: { $ifNull: ["$rows.area", ""] },
+              },
+            },
+            newOrExisting: { $ifNull: ["$rows.newOrExisting", "Existing"] },
+            orderGenerated: { $ifNull: ["$rows.orderGenerated", 0] },
+            salesInvoiced: { $ifNull: ["$rows.salesInvoiced", { $ifNull: ["$rows.sales", 0] }] },
+            collection: { $ifNull: ["$rows.poReceived", 0] },
+          },
+        },
+      ]);
+
+    const segmentIds = Array.from(
+      new Set(
+        targetRows
+          .map((doc) => String(doc?.segmentId?._id || doc?.segmentId || "").trim())
+          .filter((id) => mongoose.Types.ObjectId.isValid(id))
+      )
+    );
+    const segmentDocs = segmentIds.length
+      ? await Segment.find({ _id: { $in: segmentIds } }).select("name").lean()
+      : [];
+    const segmentLookup = new Map(segmentDocs.map((doc) => [String(doc?._id), String(doc?.name || "").trim()]));
+
+    const actualMap = new Map();
+    for (const row of actualRows) {
+      const customerKey = normalizeSegmentKey(row?.customerName);
+      const lookup = customerLookup.get(customerKey);
+      const segmentName = String(row?.segmentName || lookup?.segment || "").trim();
+      const key = normalizeSegmentKey(segmentName) || "__unassigned__";
+      const existing = actualMap.get(key) || {
+        segmentName,
+        vendorsVisited: 0,
+        newVendorsAdded: 0,
+        orderGenerated: 0,
+        salesInvoiced: 0,
+        collection: 0,
+      };
+
+      existing.segmentName = existing.segmentName || segmentName;
+      existing.vendorsVisited += 1;
+      if (String(row?.newOrExisting || "").trim() === "New") {
+        existing.newVendorsAdded += 1;
+      }
+      existing.orderGenerated += Number(row?.orderGenerated || 0);
+      existing.salesInvoiced += Number(row?.salesInvoiced || 0);
+      existing.collection += Number(row?.collection || 0);
+      actualMap.set(key, existing);
+    }
+
+    const targetMap = new Map();
+    for (const doc of targetRows) {
+      const segmentId = String(doc?.segmentId?._id || doc?.segmentId || "").trim();
+      const segmentName = String(segmentLookup.get(segmentId) || doc?.segmentId?.name || "").trim();
+      const key = normalizeSegmentKey(segmentName) || "__unassigned__";
+      const existing = targetMap.get(key) || {
+        segmentName,
+        vendorVisitTarget: 0,
+        newVendorTarget: 0,
+        salesTarget: 0,
+        collectionTarget: 0,
+      };
+
+      existing.segmentName = existing.segmentName || segmentName;
+      existing.vendorVisitTarget += Number(doc?.vendorVisitTarget || 0);
+      existing.newVendorTarget += Number(doc?.newVendorTarget || 0);
+      existing.salesTarget += Number(doc?.salesTarget || 0);
+      existing.collectionTarget += Number(doc?.collectionTarget || 0);
+      targetMap.set(key, existing);
+    }
+
+    const keys = new Set([...actualMap.keys(), ...targetMap.keys()]);
+    const items = Array.from(keys)
+      .sort((a, b) => {
+        const left = (actualMap.get(a)?.segmentName || targetMap.get(a)?.segmentName || toTitleCase(a)).toLowerCase();
+        const right = (actualMap.get(b)?.segmentName || targetMap.get(b)?.segmentName || toTitleCase(b)).toLowerCase();
+        return left.localeCompare(right);
+      })
+      .map((key) => {
+        const actual = actualMap.get(key) || {
+          segmentName: "",
+          vendorsVisited: 0,
+          newVendorsAdded: 0,
+          orderGenerated: 0,
+          salesInvoiced: 0,
+          collection: 0,
+        };
+        const target = targetMap.get(key) || {
+          segmentName: "",
+          vendorVisitTarget: 0,
+          newVendorTarget: 0,
+          salesTarget: 0,
+          collectionTarget: 0,
+        };
+
+        const segmentName = actual.segmentName || target.segmentName || toTitleCase(key) || "Unassigned";
+        const salesActual = Number(actual.salesInvoiced || 0);
+        const collectionActual = Number(actual.collection || 0);
+        const visitPending = Math.max(Number(target.vendorVisitTarget || 0) - Number(actual.vendorsVisited || 0), 0);
+        const vendorPending = Math.max(Number(target.newVendorTarget || 0) - Number(actual.newVendorsAdded || 0), 0);
+        const salesPending = Math.max(Number(target.salesTarget || 0) - salesActual, 0);
+        const collectionPending = Math.max(Number(target.collectionTarget || 0) - collectionActual, 0);
+
+        return {
+          segmentKey: key,
+          segmentName,
+          actual: {
+            vendorsVisited: Number(actual.vendorsVisited || 0),
+            newVendorsAdded: Number(actual.newVendorsAdded || 0),
+            orderGenerated: Number(actual.orderGenerated || 0),
+            salesInvoiced: salesActual,
+            sales: salesActual,
+            collection: collectionActual,
+          },
+          target: {
+            vendorVisitTarget: Number(target.vendorVisitTarget || 0),
+            newVendorTarget: Number(target.newVendorTarget || 0),
+            salesTarget: Number(target.salesTarget || 0),
+            collectionTarget: Number(target.collectionTarget || 0),
+          },
+          pending: {
+            vendorVisitPending: visitPending,
+            newVendorPending: vendorPending,
+            salesPending,
+            collectionPending,
+          },
+          pendingPct: {
+            vendorVisitPendingPct: Number(target.vendorVisitTarget || 0) ? Math.round((visitPending / Number(target.vendorVisitTarget || 0)) * 100) : 0,
+            newVendorPendingPct: Number(target.newVendorTarget || 0) ? Math.round((vendorPending / Number(target.newVendorTarget || 0)) * 100) : 0,
+            salesPendingPct: Number(target.salesTarget || 0) ? Math.round((salesPending / Number(target.salesTarget || 0)) * 100) : 0,
+            collectionPendingPct: Number(target.collectionTarget || 0) ? Math.round((collectionPending / Number(target.collectionTarget || 0)) * 100) : 0,
+          },
+        };
+      });
+
+    const summary = items.reduce(
+      (acc, item) => {
+        acc.vendorsVisited += Number(item.actual.vendorsVisited || 0);
+        acc.newVendorsAdded += Number(item.actual.newVendorsAdded || 0);
+        acc.orderGenerated += Number(item.actual.orderGenerated || 0);
+        acc.salesInvoiced += Number(item.actual.salesInvoiced || 0);
+        acc.collection += Number(item.actual.collection || 0);
+        acc.vendorVisitTarget += Number(item.target.vendorVisitTarget || 0);
+        acc.newVendorTarget += Number(item.target.newVendorTarget || 0);
+        acc.salesTarget += Number(item.target.salesTarget || 0);
+        acc.collectionTarget += Number(item.target.collectionTarget || 0);
+        return acc;
+      },
+      {
+        vendorsVisited: 0,
+        newVendorsAdded: 0,
+        orderGenerated: 0,
+        salesInvoiced: 0,
+        collection: 0,
+        vendorVisitTarget: 0,
+        newVendorTarget: 0,
+        salesTarget: 0,
+        collectionTarget: 0,
+      }
+    );
+
+    return res.json({
+      periodType,
+      periodKey,
+      items,
+      summary,
+    });
+  } catch (err) {
+    console.error("performance/me/segments error:", err);
+    return res.status(500).json({ message: err.message || "Server error" });
   }
 });
 

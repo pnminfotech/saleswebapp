@@ -4,30 +4,36 @@ const router = express.Router();
 const authModule = require("../middleware/auth");
 const { requireRole } = require("../middleware/requireRole");
 
-// ✅ Support both export styles of auth middleware
+// Support both export styles of auth middleware
 const auth = typeof authModule === "function" ? authModule : authModule.auth;
 
 const {
   upsertMyDailyReport,
   getMyDailyReportByDate,
   listMyDailyReports,
-  adminListDailyReports,adminListDailyReportsRange,adminExportDailyReportsCSV
+  getMyCustomerVisitTemplate,
+  adminUpdateDailyReport,
+  adminListFinanceEntries,
+  adminAddFinanceEntry,
+  adminDeleteFinanceEntry,
+  adminListDailyReports,
+  adminListDailyReportsRange,
+  adminExportDailyReportsCSV,
 } = require("../controllers/dailyCustomerReportController");
 
 // Salesperson
 router.post("/me", auth, requireRole("sales"), upsertMyDailyReport);
 router.get("/me", auth, requireRole("sales"), getMyDailyReportByDate);
 router.get("/me/list", auth, requireRole("sales"), listMyDailyReports);
+router.get("/me/customer-template", auth, requireRole("sales"), getMyCustomerVisitTemplate);
 
 // Admin view
-// router.get("/admin", auth, requireRole("admin"), adminListDailyReports);
-// Admin view (view-only)
 router.get("/admin", auth, requireRole("admin"), adminListDailyReports);
-
-// ✅ NEW: Admin list with filters (range)
 router.get("/admin/list", auth, requireRole("admin"), adminListDailyReportsRange);
-
-// ✅ NEW: Admin export CSV
 router.get("/admin/export.csv", auth, requireRole("admin"), adminExportDailyReportsCSV);
+router.post("/admin/update", auth, requireRole("admin"), adminUpdateDailyReport);
+router.get("/admin/finance-entries", auth, requireRole("admin"), adminListFinanceEntries);
+router.post("/admin/finance-entries", auth, requireRole("admin"), adminAddFinanceEntry);
+router.delete("/admin/finance-entries/:id", auth, requireRole("admin"), adminDeleteFinanceEntry);
 
 module.exports = router;

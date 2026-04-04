@@ -1,5 +1,6 @@
 const Target = require("../models/Target");
 const { upsertTargetSchema } = require("../utils/validators");
+const { resolveTargetRows, summarizeTargetRows } = require("../utils/targetRollup");
 
 const CompanySettings = require("../models/CompanySettings");
 async function upsertTarget(req, res) {
@@ -9,7 +10,7 @@ async function upsertTarget(req, res) {
   const d = parsed.data;
 
   const doc = await Target.findOneAndUpdate(
-    { userId: d.userId, periodType: d.periodType, periodKey: d.periodKey },
+    { userId: d.userId, segmentId: d.segmentId, periodType: d.periodType, periodKey: d.periodKey },
     {
       $set: {
         vendorVisitTarget: d.vendorVisitTarget ?? 0,
@@ -27,24 +28,35 @@ async function upsertTarget(req, res) {
 async function getMyTarget(req, res) {
   const { periodType = "MONTH", periodKey } = req.query;
   if (!periodKey) return res.status(400).json({ message: "periodKey required" });
+  const rows = await resolveTargetRows({ periodType, periodKey, userId: req.user._id });
+  res.json(summarizeTargetRows(rows));
+}
 
-  const t = await Target.findOne({
-    userId: req.user._id,
-    periodType,
-    periodKey
-  });
+async function getTargetSummary(req, res) {
+  try {
+    const { periodType = "MONTH", periodKey } = req.query;
+    if (!periodKey) return res.status(400).json({ message: "periodKey required" });
 
-  res.json(t || null);
+    const rows = await resolveTargetRows({ periodType, periodKey });
+    return res.json({
+      periodType,
+      periodKey,
+      summary: summarizeTargetRows(rows),
+      rows,
+    });
+  } catch (e) {
+    return res.status(500).json({ message: e.message || "Failed to load target summary" });
+  }
 }
 async function getOneTargetForAdmin(req, res) {
   try {
-    const { userId, periodType, periodKey } = req.query;
+    const { userId, segmentId, periodType, periodKey } = req.query;
 
-    if (!userId || !periodType || !periodKey) {
-      return res.status(400).json({ message: "userId, periodType, periodKey are required" });
+    if (!userId || !segmentId || !periodType || !periodKey) {
+      return res.status(400).json({ message: "userId, segmentId, periodType, periodKey are required" });
     }
 
-    const t = await Target.findOne({ userId, periodType, periodKey });
+    const t = await Target.findOne({ userId, segmentId, periodType, periodKey });
     return res.json(t || null);
   } catch (e) {
     return res.status(500).json({ message: e.message });
@@ -52,16 +64,18 @@ async function getOneTargetForAdmin(req, res) {
 }
 async function listTargetsForAdmin(req, res) {
   try {
-    const { userId, periodType, periodKey } = req.query;
+    const { userId, segmentId, periodType, periodKey } = req.query;
 
     const q = {};
     if (userId) q.userId = userId;
+    if (segmentId) q.segmentId = segmentId;
     if (periodType) q.periodType = periodType;
     if (periodKey) q.periodKey = periodKey;
 
     const items = await Target.find(q)
       .sort({ periodType: 1, periodKey: 1, createdAt: -1 })
-      .populate("userId", "name email"); // show salesperson name/email
+      .populate("userId", "name email")
+      .populate("segmentId", "name");
 
     return res.json(items);
   } catch (e) {
@@ -188,4 +202,11 @@ async function upsertAnnualAndGenerate(req, res) {
 }
 
 
-module.exports = { upsertTarget, getMyTarget , getOneTargetForAdmin, listTargetsForAdmin,upsertAnnualAndGenerate};
+module.exports = {
+  upsertTarget,
+  getMyTarget,
+  getTargetSummary,
+  getOneTargetForAdmin,
+  listTargetsForAdmin,
+  upsertAnnualAndGenerate,
+};

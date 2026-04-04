@@ -1,10 +1,230 @@
 const DailyCustomerReport = require("../models/DailyCustomerReport");
 const Customer = require("../models/Customer");
-
-const User = require("../models/User"); // if you want join info (optional)
+const DailyReportFinanceEntry = require("../models/DailyReportFinanceEntry");
 
 function isValidDateKey(s) {
   return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+
+function normalizeDateField(value) {
+  const s = String(value || "").trim();
+  return isValidDateKey(s) ? s : "";
+}
+
+async function rebuildFinanceTotalsForReport(reportDoc) {
+  if (!reportDoc) return null;
+
+  const entries = await DailyReportFinanceEntry.find({
+    dailyReportId: reportDoc._id,
+  })
+    .sort({ entryDate: 1, createdAt: 1 })
+    .lean();
+
+  const rows = Array.isArray(reportDoc.rows) ? reportDoc.rows : [];
+  const nextRows = rows.map((row) => {
+    const rowId = String(row?._id || "");
+    const rowEntries = entries.filter((entry) => String(entry?.rowId || "") === rowId);
+    const invoiceEntries = rowEntries.filter((entry) => entry.type === "INVOICE");
+    const collectionEntries = rowEntries.filter((entry) => entry.type === "COLLECTION");
+    const salesInvoiced = invoiceEntries.reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
+    const poReceived = collectionEntries.reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
+    const salesInvoiceDate = invoiceEntries.length ? String(invoiceEntries[invoiceEntries.length - 1].entryDate || "") : "";
+    const collectionDate = collectionEntries.length ? String(collectionEntries[collectionEntries.length - 1].entryDate || "") : "";
+
+    return {
+      ...row,
+      salesInvoiced,
+      sales: salesInvoiced,
+      salesInvoiceDate,
+      poReceived,
+      collectionDate,
+    };
+  });
+
+  reportDoc.rows = nextRows;
+  await reportDoc.save();
+  return { report: reportDoc, entries };
+}
+
+async function buildCustomerLookup() {
+  const customers = await Customer.find({}).select("name area segment").lean();
+  const map = new Map();
+
+  for (const customer of customers) {
+    const key = String(customer?.name || "").trim().toLowerCase();
+    if (!key || map.has(key)) continue;
+    map.set(key, {
+      area: String(customer?.area || "").trim(),
+      segment: String(customer?.segment || "").trim(),
+    });
+  }
+
+  return map;
+}
+
+function enrichCustomerRow(row, customerLookup) {
+  const rowId = String(row?._id || row?.rowId || "").trim();
+  const name = String(row?.customerName || "").trim();
+  const found = customerLookup.get(name.toLowerCase());
+  const orderGenerated = Number(
+    row?.orderGenerated ?? row?.order ?? row?.orderValue ?? row?.orderAmount ?? 0
+  );
+  const salesInvoiced = Number(
+    row?.salesInvoiced ?? row?.sales ?? row?.salesAmount ?? row?.invoiceAmount ?? 0
+  );
+  const poReceived = Number(row?.poReceived ?? row?.collection ?? row?.collected ?? 0);
+
+  return {
+    _id: rowId,
+    rowId,
+    customerName: name,
+    newOrExisting: row?.newOrExisting === "New" ? "New" : "Existing",
+    area: String(row?.area || found?.area || "").trim(),
+    metTo: String(row?.metTo || "").trim(),
+    designation: String(row?.designation || "").trim(),
+    enquiryMode: String(row?.enquiryMode || "").trim(),
+    orderGenerated,
+    salesInvoiced,
+    sales: salesInvoiced,
+    segment: String(row?.segment || found?.segment || "").trim(),
+    poReceived,
+    salesInvoiceDate: normalizeDateField(row?.salesInvoiceDate || row?.invoiceDate || row?.salesInvoicedDate),
+    collectionDate: normalizeDateField(row?.collectionDate || row?.poReceivedDate || row?.receivedDate),
+  };
+}
+
+function normalizeCustomerKey(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+async function buildLatestCustomerVisitTemplate(userId, customerName) {
+  const name = String(customerName || "").trim();
+  if (!name) return null;
+
+  const reports = await DailyCustomerReport.find({ userId })
+    .select("reportDateKey rows")
+    .sort({ reportDateKey: -1, updatedAt: -1 })
+    .lean();
+
+  let matchedRow = null;
+  for (const report of reports) {
+    const rows = Array.isArray(report?.rows) ? report.rows : [];
+    matchedRow = rows.find((r) => normalizeCustomerKey(r?.customerName) === normalizeCustomerKey(name));
+    if (matchedRow) break;
+  }
+
+  const customerLookup = await buildCustomerLookup();
+  const master = customerLookup.get(normalizeCustomerKey(name)) || {};
+  const base = matchedRow
+    ? enrichCustomerRow(matchedRow, customerLookup)
+    : {
+        customerName: name,
+        newOrExisting: "Existing",
+        area: "",
+        metTo: "",
+        designation: "",
+        enquiryMode: "",
+        orderGenerated: 0,
+        salesInvoiced: 0,
+        sales: 0,
+        segment: "",
+        poReceived: 0,
+      };
+
+  return {
+    ...base,
+    customerName: name,
+    area: String(base.area || master.area || "").trim(),
+    segment: String(base.segment || master.segment || "").trim(),
+  };
+}
+
+async function normalizeDailyReportRows(rows, userId, { createMissingCustomers = true, createAllCustomers = false } = {}) {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const cleanedRows = safeRows
+    .map((r) => {
+      const customerName = String(r?.customerName || r?.customer || r?.name || "").trim();
+      return {
+        customerName,
+        newOrExisting: String(r?.newOrExisting || r?.type || "").trim() === "New" ? "New" : "Existing",
+        area: String(r?.area || r?.location || "").trim(),
+        metTo: String(r?.metTo || r?.met_to || "").trim(),
+        designation: String(r?.designation || r?.designationName || "").trim(),
+        enquiryMode: String(r?.enquiryMode || r?.mode || r?.modeOfEnquiry || "").trim(),
+        orderGenerated: Number(r?.orderGenerated ?? r?.order ?? r?.orderValue ?? r?.orderAmount ?? 0),
+        salesInvoiced: Number(r?.salesInvoiced ?? r?.sales ?? r?.salesAmount ?? r?.invoiceAmount ?? 0),
+        segment: String(r?.segment || r?.segmentName || "").trim(),
+        poReceived: Number(r?.poReceived ?? r?.collection ?? r?.collected ?? 0),
+        salesInvoiceDate: normalizeDateField(r?.salesInvoiceDate || r?.invoiceDate || r?.salesInvoicedDate),
+        collectionDate: normalizeDateField(r?.collectionDate || r?.poReceivedDate || r?.receivedDate),
+      };
+    })
+    .filter((r) => r.customerName);
+
+  if (createMissingCustomers && userId) {
+    const rowsToCreate = createAllCustomers
+      ? cleanedRows
+      : cleanedRows.filter((r) => r.newOrExisting === "New");
+
+    const newNames = rowsToCreate
+      .map((r) => ({
+        name: r.customerName,
+        area: r.area || "",
+        segment: r.segment || "",
+        createdBy: userId,
+        isActive: true,
+      }));
+
+    for (const n of newNames) {
+      const exists = await Customer.findOne({ name: { $regex: `^${n.name}$`, $options: "i" } });
+      if (!exists) await Customer.create(n);
+    }
+  }
+
+  return cleanedRows;
+}
+
+function rowIdentityKey(row = {}) {
+  return [
+    String(row?._id || "").trim(),
+    normalizeCustomerKey(row?.customerName),
+    normalizeCustomerKey(row?.area),
+    normalizeCustomerKey(row?.metTo),
+    normalizeCustomerKey(row?.designation),
+    Number(row?.orderGenerated || row?.order || 0),
+    normalizeCustomerKey(row?.segment),
+  ].join("|");
+}
+
+function mergeSalespersonFinancials(existingRows, incomingRows) {
+  const existingMap = new Map();
+  for (const row of Array.isArray(existingRows) ? existingRows : []) {
+    existingMap.set(rowIdentityKey(row), row);
+    if (row?._id) existingMap.set(String(row._id), row);
+  }
+
+  return (Array.isArray(incomingRows) ? incomingRows : []).map((row) => {
+    const existing = existingMap.get(String(row?._id || "")) || existingMap.get(rowIdentityKey(row)) || null;
+    if (!existing) return row;
+
+    const salesInvoiced = Number(row?.salesInvoiced || 0) || Number(existing?.salesInvoiced || existing?.sales || 0);
+    const poReceived = Number(row?.poReceived || 0) || Number(existing?.poReceived || existing?.collection || existing?.collected || 0);
+    const salesInvoiceDate = normalizeDateField(
+      row?.salesInvoiceDate || row?.invoiceDate || row?.salesInvoicedDate || existing?.salesInvoiceDate
+    );
+    const collectionDate = normalizeDateField(
+      row?.collectionDate || row?.poReceivedDate || row?.receivedDate || existing?.collectionDate
+    );
+
+    return {
+      ...row,
+      salesInvoiced,
+      sales: salesInvoiced,
+      poReceived,
+      salesInvoiceDate,
+      collectionDate,
+    };
+  });
 }
 
 exports.upsertMyDailyReport = async (req, res) => {
@@ -26,35 +246,11 @@ exports.upsertMyDailyReport = async (req, res) => {
       return res.status(400).json({ message: "Closing KM cannot be less than Opening KM" });
     }
 
-    const safeRows = Array.isArray(rows) ? rows : [];
-    // minimal cleanup
-    const cleanedRows = safeRows.map((r) => ({
-      customerName: String(r.customerName || "").trim(),
-      newOrExisting: r.newOrExisting === "New" ? "New" : "Existing",
-      area: String(r.area || "").trim(),
-      metTo: String(r.metTo || "").trim(),
-      designation: String(r.designation || "").trim(),
-      enquiryMode: String(r.enquiryMode || "").trim(),
-      orderGenerated: Number(r.orderGenerated || 0),
-      segment: String(r.segment || "").trim(),
-      poReceived: Number(r.poReceived || 0),
-    })).filter(r => r.customerName);
-// Auto-create NEW customers in master list
-const newNames = cleanedRows
-  .filter((r) => r.newOrExisting === "New")
-  .map((r) => ({
-    name: r.customerName,
-    area: r.area || "",
-    segment: r.segment || "",
-    createdBy: userId,
-    isActive: true,
-  }));
-
-for (const n of newNames) {
-  // upsert by case-insensitive match
-  const exists = await Customer.findOne({ name: { $regex: `^${n.name}$`, $options: "i" } });
-  if (!exists) await Customer.create(n);
-}
+    const existingDoc = await DailyCustomerReport.findOne({ userId, reportDateKey }).select("rows").lean();
+    const cleanedRows = await normalizeDailyReportRows(rows, userId);
+    const mergedRows = existingDoc?.rows?.length
+      ? mergeSalespersonFinancials(existingDoc.rows, cleanedRows)
+      : cleanedRows;
 
     let cleanStartLocation = null;
     if (startLocation && Number.isFinite(Number(startLocation.lat)) && Number.isFinite(Number(startLocation.lng))) {
@@ -92,7 +288,7 @@ for (const n of newNames) {
     const setObj = {
       openingKm: open,
       closingKm: close,
-      rows: cleanedRows,
+      rows: mergedRows,
     };
 
     if (cleanStartLocation) setObj.startLocation = cleanStartLocation;
@@ -129,6 +325,160 @@ exports.getMyDailyReportByDate = async (req, res) => {
     return res.json(doc || null);
   } catch (e) {
     return res.status(500).json({ message: e.message });
+  }
+};
+
+exports.getMyCustomerVisitTemplate = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const customerName = String(req.query.customerName || req.query.name || "").trim();
+
+    if (!customerName) {
+      return res.status(400).json({ message: "customerName required" });
+    }
+
+    const template = await buildLatestCustomerVisitTemplate(userId, customerName);
+    return res.json(template || null);
+  } catch (e) {
+    return res.status(500).json({ message: e.message || "Failed to load customer template" });
+  }
+};
+
+exports.adminUpdateDailyReport = async (req, res) => {
+  try {
+    const { reportDateKey, userId, rows } = req.body;
+
+    if (!isValidDateKey(reportDateKey)) {
+      return res.status(400).json({ message: "reportDateKey must be YYYY-MM-DD" });
+    }
+    if (!userId) {
+      return res.status(400).json({ message: "userId required" });
+    }
+    if (!Array.isArray(rows) || !rows.length) {
+      return res.status(400).json({ message: "rows required" });
+    }
+
+    const doc = await DailyCustomerReport.findOne({ userId, reportDateKey });
+    if (!doc) {
+      return res.status(404).json({ message: "Daily report not found" });
+    }
+
+    const cleanedRows = await normalizeDailyReportRows(rows, userId, {
+      createMissingCustomers: false,
+      createAllCustomers: false,
+    });
+    if (!cleanedRows.length) {
+      return res.status(400).json({ message: "No valid client rows found" });
+    }
+
+    doc.rows = cleanedRows;
+    await doc.save();
+
+    return res.json({
+      message: "Daily report updated successfully",
+      report: doc,
+    });
+  } catch (e) {
+    return res.status(500).json({ message: e.message || "Failed to update daily report" });
+  }
+};
+
+exports.adminListFinanceEntries = async (req, res) => {
+  try {
+    const { userId, reportDateKey } = req.query;
+    const q = {};
+    if (userId) q.userId = userId;
+    if (reportDateKey && isValidDateKey(String(reportDateKey))) q.reportDateKey = reportDateKey;
+
+    const entries = await DailyReportFinanceEntry.find(q)
+      .sort({ entryDate: 1, createdAt: 1 })
+      .lean();
+
+    return res.json({ items: entries });
+  } catch (e) {
+    return res.status(500).json({ message: e.message || "Failed to load finance entries" });
+  }
+};
+
+exports.adminAddFinanceEntry = async (req, res) => {
+  try {
+    const {
+      reportDateKey,
+      userId,
+      rowId,
+      customerName,
+      type,
+      amount,
+      entryDate,
+      note,
+    } = req.body;
+
+    if (!isValidDateKey(reportDateKey)) {
+      return res.status(400).json({ message: "reportDateKey must be YYYY-MM-DD" });
+    }
+    if (!userId) return res.status(400).json({ message: "userId required" });
+    if (!rowId) return res.status(400).json({ message: "rowId required" });
+    if (!String(customerName || "").trim()) return res.status(400).json({ message: "customerName required" });
+    if (!["INVOICE", "COLLECTION"].includes(String(type || "").trim())) {
+      return res.status(400).json({ message: "type must be INVOICE or COLLECTION" });
+    }
+    const amt = Number(amount || 0);
+    if (!Number.isFinite(amt) || amt <= 0) {
+      return res.status(400).json({ message: "amount must be greater than 0" });
+    }
+    if (!isValidDateKey(String(entryDate || ""))) {
+      return res.status(400).json({ message: "entryDate must be YYYY-MM-DD" });
+    }
+
+    const reportDoc = await DailyCustomerReport.findOne({ userId, reportDateKey });
+    if (!reportDoc) return res.status(404).json({ message: "Daily report not found" });
+
+    const row = (Array.isArray(reportDoc.rows) ? reportDoc.rows : []).find((r) => String(r?._id || "") === String(rowId));
+    if (!row) return res.status(404).json({ message: "Client row not found in report" });
+
+    const createdBy = req.user.id;
+    const entry = await DailyReportFinanceEntry.create({
+      userId,
+      reportDateKey,
+      dailyReportId: reportDoc._id,
+      rowId,
+      customerName: String(customerName).trim(),
+      type: String(type).trim(),
+      amount: amt,
+      entryDate: String(entryDate).trim(),
+      note: String(note || "").trim(),
+      createdBy,
+    });
+
+    const rebuilt = await rebuildFinanceTotalsForReport(reportDoc);
+    return res.json({
+      message: "Finance entry added successfully",
+      entry,
+      report: rebuilt?.report || reportDoc,
+      entries: rebuilt?.entries || [],
+    });
+  } catch (e) {
+    return res.status(500).json({ message: e.message || "Failed to add finance entry" });
+  }
+};
+
+exports.adminDeleteFinanceEntry = async (req, res) => {
+  try {
+    const entry = await DailyReportFinanceEntry.findById(req.params.id).lean();
+    if (!entry) return res.status(404).json({ message: "Finance entry not found" });
+
+    const reportDoc = await DailyCustomerReport.findById(entry.dailyReportId);
+    if (!reportDoc) return res.status(404).json({ message: "Daily report not found" });
+
+    await DailyReportFinanceEntry.deleteOne({ _id: entry._id });
+    const rebuilt = await rebuildFinanceTotalsForReport(reportDoc);
+    return res.json({
+      message: "Finance entry deleted successfully",
+      report: rebuilt?.report || reportDoc,
+      entries: rebuilt?.entries || [],
+    });
+  } catch (e) {
+    return res.status(500).json({ message: e.message || "Failed to delete finance entry" });
   }
 };
 
@@ -190,6 +540,8 @@ exports.adminListDailyReportsRange = async (req, res) => {
       return res.status(400).json({ message: "'from' date cannot be after 'to' date" });
     }
 
+    const customerLookup = await buildCustomerLookup();
+
     const filter = {};
     if (userId) filter.userId = userId;
 
@@ -209,6 +561,7 @@ exports.adminListDailyReportsRange = async (req, res) => {
     // Totals for summary
     let totalNetKm = 0;
     let totalOrder = 0;
+    let totalSalesInvoiced = 0;
     let totalPO = 0;
     let totalRows = 0;
 
@@ -218,12 +571,15 @@ exports.adminListDailyReportsRange = async (req, res) => {
       const netKm = closing - opening;
 
       const rows = Array.isArray(r.rows) ? r.rows : [];
-      const orderSum = rows.reduce((a, x) => a + Number(x.orderGenerated || 0), 0);
-      const poSum = rows.reduce((a, x) => a + Number(x.poReceived || 0), 0);
-      const clientVisits = rows
+      const enrichedRows = rows.map((x) => enrichCustomerRow(x, customerLookup));
+      const orderSum = enrichedRows.reduce((a, x) => a + Number(x.orderGenerated || 0), 0);
+      const salesInvoicedSum = enrichedRows.reduce((a, x) => a + Number(x.salesInvoiced || x.sales || 0), 0);
+      const poSum = enrichedRows.reduce((a, x) => a + Number(x.poReceived || 0), 0);
+      const clientVisits = enrichedRows
         .map((x) => ({
           customerName: String(x?.customerName || "").trim(),
           area: String(x?.area || "").trim(),
+          segment: String(x?.segment || "").trim(),
         }))
         .filter((x) => x.customerName);
 
@@ -236,6 +592,7 @@ exports.adminListDailyReportsRange = async (req, res) => {
 
       totalNetKm += netKm;
       totalOrder += orderSum;
+      totalSalesInvoiced += salesInvoicedSum;
       totalPO += poSum;
       totalRows += rows.length;
 
@@ -257,17 +614,11 @@ exports.adminListDailyReportsRange = async (req, res) => {
         netKm,
         rowsCount: rows.length,
         orderSum,
+        salesInvoicedSum,
         poSum,
         clientVisits: uniqClientVisits,
         // keep row-level values for combined customer analytics screens
-        rows: rows.map((x) => ({
-          customerName: String(x?.customerName || "").trim(),
-          area: String(x?.area || "").trim(),
-          orderGenerated: Number(x?.orderGenerated || 0),
-          poReceived: Number(x?.poReceived || 0),
-          newOrExisting: x?.newOrExisting === "New" ? "New" : "Existing",
-          enquiryMode: String(x?.enquiryMode || "").trim(),
-        })),
+        rows: enrichedRows,
       };
     });
 
@@ -278,6 +629,7 @@ exports.adminListDailyReportsRange = async (req, res) => {
         totalRows,
         totalNetKm,
         totalOrder,
+        totalSalesInvoiced,
         totalPO,
       },
     });
@@ -302,6 +654,8 @@ exports.adminExportDailyReportsCSV = async (req, res) => {
     if (from && to && String(from) > String(to)) {
       return res.status(400).json({ message: "'from' date cannot be after 'to' date" });
     }
+
+    const customerLookup = await buildCustomerLookup();
 
     const filter = {};
     if (userId) filter.userId = userId;
@@ -336,8 +690,11 @@ exports.adminExportDailyReportsCSV = async (req, res) => {
       "metTo",
       "designation",
       "orderGenerated",
+      "salesInvoiced",
+      "salesInvoiceDate",
       "segment",
       "poReceived",
+      "collectionDate",
     ];
 
     const rows = [header.join(",")];
@@ -354,7 +711,7 @@ exports.adminExportDailyReportsCSV = async (req, res) => {
         ? new Date(r.startLocation.capturedAt).toISOString()
         : "";
       const trackPoints = Array.isArray(r?.locationTrail) ? r.locationTrail.length : 0;
-      const items = Array.isArray(r.rows) ? r.rows : [];
+      const items = (Array.isArray(r.rows) ? r.rows : []).map((it) => enrichCustomerRow(it, customerLookup));
 
       if (!items.length) {
         // still output one line per report
@@ -370,7 +727,7 @@ exports.adminExportDailyReportsCSV = async (req, res) => {
             Number.isFinite(startAccuracy) ? startAccuracy : "",
             startCapturedAt,
             trackPoints,
-            "", "", "", "", "", "", "", ""
+            "", "", "", "", "", "", "", "", ""
           ].join(",")
         );
         continue;
@@ -401,8 +758,11 @@ exports.adminExportDailyReportsCSV = async (req, res) => {
             safe(it.metTo),
             safe(it.designation),
             Number(it.orderGenerated || 0),
+            Number(it.salesInvoiced || it.sales || 0),
+            safe(it.salesInvoiceDate || ""),
             safe(it.segment),
             Number(it.poReceived || 0),
+            safe(it.collectionDate || ""),
           ].join(",")
         );
       }

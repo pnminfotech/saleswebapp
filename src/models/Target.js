@@ -3,6 +3,8 @@ const mongoose = require("mongoose");
 const targetSchema = new mongoose.Schema(
   {
     userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    salespersonName: { type: String, trim: true, default: "" },
+    salespersonEmail: { type: String, trim: true, default: "" },
     segmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Segment", required: true },
     periodType: { type: String, enum: ["MONTH", "QUARTER", "YEAR"], required: true },
     periodKey: { type: String, required: true }, // 2026-02, 2026-Q1, FY2026

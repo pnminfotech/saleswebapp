@@ -1,0 +1,7 @@
+
+> sales-mis-server@1.0.0 start
+> node src/server.js
+
+[dotenv@17.2.3] injecting env (11) from .env -- tip: ⚙️  load multiple .env files with { path: ['.env.local', '.env'] }
+✅ MongoDB connected
+✅ API running: http://localhost:5000

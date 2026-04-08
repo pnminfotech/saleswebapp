@@ -1,13 +1,38 @@
 const Target = require("../models/Target");
+const User = require("../models/User");
 const { upsertTargetSchema } = require("../utils/validators");
 const { resolveTargetRows, summarizeTargetRows } = require("../utils/targetRollup");
 
 const CompanySettings = require("../models/CompanySettings");
+
+function normalizeLookupKey(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function matchesSegmentFilter(row, segmentId) {
+  const filterKey = normalizeLookupKey(segmentId);
+  if (!filterKey) return true;
+
+  const rowSegmentId = normalizeLookupKey(row?.segmentId?._id || row?.segmentId);
+  const rowSegmentName = normalizeLookupKey(row?.segmentId?.name);
+  return rowSegmentId === filterKey || rowSegmentName === filterKey;
+}
+
+async function buildSalespersonSnapshot(userId) {
+  if (!userId) return { salespersonName: "", salespersonEmail: "" };
+  const user = await User.findById(userId).select("name email").lean();
+  return {
+    salespersonName: String(user?.name || "").trim(),
+    salespersonEmail: String(user?.email || "").trim(),
+  };
+}
+
 async function upsertTarget(req, res) {
   const parsed = upsertTargetSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ message: "Invalid input" });
 
   const d = parsed.data;
+  const snapshot = await buildSalespersonSnapshot(d.userId);
 
   const doc = await Target.findOneAndUpdate(
     { userId: d.userId, segmentId: d.segmentId, periodType: d.periodType, periodKey: d.periodKey },
@@ -17,10 +42,22 @@ async function upsertTarget(req, res) {
         newVendorTarget: d.newVendorTarget ?? 0,
         salesTarget: d.salesTarget ?? 0,
         collectionTarget: d.collectionTarget ?? 0
+      },
+      $setOnInsert: {
+        salespersonName: snapshot.salespersonName,
+        salespersonEmail: snapshot.salespersonEmail,
       }
     },
     { upsert: true, new: true }
   );
+
+  if (!doc.salespersonName && snapshot.salespersonName) {
+    doc.salespersonName = snapshot.salespersonName;
+  }
+  if (!doc.salespersonEmail && snapshot.salespersonEmail) {
+    doc.salespersonEmail = snapshot.salespersonEmail;
+  }
+  await doc.save();
 
   res.json(doc);
 }
@@ -34,10 +71,11 @@ async function getMyTarget(req, res) {
 
 async function getTargetSummary(req, res) {
   try {
-    const { periodType = "MONTH", periodKey } = req.query;
+    const { periodType = "MONTH", periodKey, userId, segmentId } = req.query;
     if (!periodKey) return res.status(400).json({ message: "periodKey required" });
 
-    const rows = await resolveTargetRows({ periodType, periodKey });
+    let rows = await resolveTargetRows({ periodType, periodKey, userId });
+    rows = rows.filter((row) => matchesSegmentFilter(row, segmentId));
     return res.json({
       periodType,
       periodKey,
@@ -73,6 +111,7 @@ async function listTargetsForAdmin(req, res) {
     if (periodKey) q.periodKey = periodKey;
 
     const items = await Target.find(q)
+      .select("userId salespersonName salespersonEmail segmentId periodType periodKey vendorVisitTarget newVendorTarget salesTarget collectionTarget source parentKey createdAt updatedAt")
       .sort({ periodType: 1, periodKey: 1, createdAt: -1 })
       .populate("userId", "name email")
       .populate("segmentId", "name");
@@ -83,8 +122,27 @@ async function listTargetsForAdmin(req, res) {
   }
 }
 
+async function deleteTarget(req, res) {
+  try {
+    const { id } = req.params;
+    if (!id) {
+      return res.status(400).json({ message: "Target id required" });
+    }
+
+    const deleted = await Target.findByIdAndDelete(id);
+    if (!deleted) {
+      return res.status(404).json({ message: "Target not found" });
+    }
+
+    return res.json({ message: "Target deleted", deletedId: id });
+  } catch (e) {
+    return res.status(500).json({ message: e.message || "Failed to delete target" });
+  }
+}
+
 // helper: upsert but preserve MANUAL children if overwriteAutoOnly is true
 async function upsertChild({ userId, periodType, periodKey, parentKey, data, overwriteAutoOnly }) {
+  const snapshot = await buildSalespersonSnapshot(userId);
   const existing = await Target.findOne({ userId, periodType, periodKey });
 
   if (existing) {
@@ -93,6 +151,8 @@ async function upsertChild({ userId, periodType, periodKey, parentKey, data, ove
     existing.newVendorTarget = data.newVendorTarget ?? 0;
     existing.salesTarget = data.salesTarget ?? 0;
     existing.collectionTarget = data.collectionTarget ?? 0;
+    existing.salespersonName = existing.salespersonName || snapshot.salespersonName;
+    existing.salespersonEmail = existing.salespersonEmail || snapshot.salespersonEmail;
     existing.source = "AUTO";
     existing.parentKey = parentKey;
     return existing.save();
@@ -100,6 +160,8 @@ async function upsertChild({ userId, periodType, periodKey, parentKey, data, ove
 
   return Target.create({
     userId,
+    salespersonName: snapshot.salespersonName,
+    salespersonEmail: snapshot.salespersonEmail,
     periodType,
     periodKey,
     ...data,
@@ -124,6 +186,8 @@ async function upsertAnnualAndGenerate(req, res) {
       return res.status(400).json({ message: "userId and yearKey are required" });
     }
 
+    const snapshot = await buildSalespersonSnapshot(userId);
+
     // 1) upsert annual as MANUAL
     const annual = await Target.findOneAndUpdate(
       { userId, periodType: "YEAR", periodKey: yearKey },
@@ -135,10 +199,20 @@ async function upsertAnnualAndGenerate(req, res) {
           collectionTarget: Number(collectionTarget || 0),
           source: "MANUAL",
           parentKey: "",
+          salespersonName: snapshot.salespersonName,
+          salespersonEmail: snapshot.salespersonEmail,
+        },
+        $setOnInsert: {
+          salespersonName: snapshot.salespersonName,
+          salespersonEmail: snapshot.salespersonEmail,
         },
       },
       { upsert: true, new: true }
     );
+
+    if (!annual.salespersonName && snapshot.salespersonName) annual.salespersonName = snapshot.salespersonName;
+    if (!annual.salespersonEmail && snapshot.salespersonEmail) annual.salespersonEmail = snapshot.salespersonEmail;
+    await annual.save();
 
     // 2) generate quarters + months (equal split)
     const qData = {
@@ -208,5 +282,6 @@ module.exports = {
   getTargetSummary,
   getOneTargetForAdmin,
   listTargetsForAdmin,
+  deleteTarget,
   upsertAnnualAndGenerate,
 };

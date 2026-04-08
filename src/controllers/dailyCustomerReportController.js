@@ -1,6 +1,10 @@
+const mongoose = require("mongoose");
+
 const DailyCustomerReport = require("../models/DailyCustomerReport");
 const Customer = require("../models/Customer");
+const User = require("../models/User");
 const DailyReportFinanceEntry = require("../models/DailyReportFinanceEntry");
+const { getRange } = require("../utils/period");
 
 function isValidDateKey(s) {
   return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
@@ -9,6 +13,19 @@ function isValidDateKey(s) {
 function normalizeDateField(value) {
   const s = String(value || "").trim();
   return isValidDateKey(s) ? s : "";
+}
+
+function readCollectionAmount(row = {}) {
+  return Number(row?.poReceived ?? row?.salespersonPoReceived ?? row?.collection ?? row?.collected ?? 0);
+}
+
+async function buildSalespersonSnapshot(userId) {
+  if (!userId) return { salespersonName: "", salespersonEmail: "" };
+  const user = await User.findById(userId).select("name email").lean();
+  return {
+    salespersonName: String(user?.name || "").trim(),
+    salespersonEmail: String(user?.email || "").trim(),
+  };
 }
 
 async function rebuildFinanceTotalsForReport(reportDoc) {
@@ -26,13 +43,20 @@ async function rebuildFinanceTotalsForReport(reportDoc) {
     const rowEntries = entries.filter((entry) => String(entry?.rowId || "") === rowId);
     const invoiceEntries = rowEntries.filter((entry) => entry.type === "INVOICE");
     const collectionEntries = rowEntries.filter((entry) => entry.type === "COLLECTION");
-    const salesInvoiced = invoiceEntries.reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
-    const poReceived = collectionEntries.reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
+    const adminSalesInvoiced = invoiceEntries.reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
+    const salespersonSalesInvoiced = Number(row?.salespersonSalesInvoiced ?? 0);
+    const salesInvoiced = salespersonSalesInvoiced + adminSalesInvoiced;
+    const salespersonPoReceived = Number(
+      row?.salespersonPoReceived ?? row?.poReceived ?? row?.collection ?? row?.collected ?? 0
+    );
+    const adminCollection = collectionEntries.reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
+    const poReceived = salespersonPoReceived + adminCollection;
     const salesInvoiceDate = invoiceEntries.length ? String(invoiceEntries[invoiceEntries.length - 1].entryDate || "") : "";
     const collectionDate = collectionEntries.length ? String(collectionEntries[collectionEntries.length - 1].entryDate || "") : "";
 
     return {
       ...row,
+      salespersonPoReceived,
       salesInvoiced,
       sales: salesInvoiced,
       salesInvoiceDate,
@@ -44,6 +68,10 @@ async function rebuildFinanceTotalsForReport(reportDoc) {
   reportDoc.rows = nextRows;
   await reportDoc.save();
   return { report: reportDoc, entries };
+}
+
+function normalizeCustomerKey(value) {
+  return String(value || "").trim().toLowerCase();
 }
 
 async function buildCustomerLookup() {
@@ -72,7 +100,11 @@ function enrichCustomerRow(row, customerLookup) {
   const salesInvoiced = Number(
     row?.salesInvoiced ?? row?.sales ?? row?.salesAmount ?? row?.invoiceAmount ?? 0
   );
-  const poReceived = Number(row?.poReceived ?? row?.collection ?? row?.collected ?? 0);
+  const poReceived = readCollectionAmount(row);
+  const salespersonPoReceived = Number(
+    row?.salespersonPoReceived ?? row?.poReceived ?? row?.collection ?? row?.collected ?? 0
+  );
+  const salespersonSalesInvoiced = Number(row?.salespersonSalesInvoiced ?? 0);
 
   return {
     _id: rowId,
@@ -87,14 +119,12 @@ function enrichCustomerRow(row, customerLookup) {
     salesInvoiced,
     sales: salesInvoiced,
     segment: String(row?.segment || found?.segment || "").trim(),
+    salespersonSalesInvoiced,
+    salespersonPoReceived,
     poReceived,
     salesInvoiceDate: normalizeDateField(row?.salesInvoiceDate || row?.invoiceDate || row?.salesInvoicedDate),
     collectionDate: normalizeDateField(row?.collectionDate || row?.poReceivedDate || row?.receivedDate),
   };
-}
-
-function normalizeCustomerKey(value) {
-  return String(value || "").trim().toLowerCase();
 }
 
 async function buildLatestCustomerVisitTemplate(userId, customerName) {
@@ -128,6 +158,8 @@ async function buildLatestCustomerVisitTemplate(userId, customerName) {
         salesInvoiced: 0,
         sales: 0,
         segment: "",
+        salespersonSalesInvoiced: 0,
+        salespersonPoReceived: 0,
         poReceived: 0,
       };
 
@@ -136,6 +168,8 @@ async function buildLatestCustomerVisitTemplate(userId, customerName) {
     customerName: name,
     area: String(base.area || master.area || "").trim(),
     segment: String(base.segment || master.segment || "").trim(),
+    poReceived: base.salespersonPoReceived ?? base.poReceived ?? 0,
+    salesInvoiced: base.salespersonSalesInvoiced ?? base.salesInvoiced ?? 0,
   };
 }
 
@@ -153,8 +187,10 @@ async function normalizeDailyReportRows(rows, userId, { createMissingCustomers =
         enquiryMode: String(r?.enquiryMode || r?.mode || r?.modeOfEnquiry || "").trim(),
         orderGenerated: Number(r?.orderGenerated ?? r?.order ?? r?.orderValue ?? r?.orderAmount ?? 0),
         salesInvoiced: Number(r?.salesInvoiced ?? r?.sales ?? r?.salesAmount ?? r?.invoiceAmount ?? 0),
+        salespersonSalesInvoiced: Number(r?.salespersonSalesInvoiced ?? r?.salesInvoiced ?? r?.sales ?? r?.salesAmount ?? r?.invoiceAmount ?? 0),
         segment: String(r?.segment || r?.segmentName || "").trim(),
-        poReceived: Number(r?.poReceived ?? r?.collection ?? r?.collected ?? 0),
+        salespersonPoReceived: Number(r?.salespersonPoReceived ?? r?.poReceived ?? r?.collection ?? r?.collected ?? 0),
+        poReceived: Number(r?.poReceived ?? r?.salespersonPoReceived ?? r?.collection ?? r?.collected ?? 0),
         salesInvoiceDate: normalizeDateField(r?.salesInvoiceDate || r?.invoiceDate || r?.salesInvoicedDate),
         collectionDate: normalizeDateField(r?.collectionDate || r?.poReceivedDate || r?.receivedDate),
       };
@@ -208,7 +244,14 @@ function mergeSalespersonFinancials(existingRows, incomingRows) {
     if (!existing) return row;
 
     const salesInvoiced = Number(row?.salesInvoiced || 0) || Number(existing?.salesInvoiced || existing?.sales || 0);
-    const poReceived = Number(row?.poReceived || 0) || Number(existing?.poReceived || existing?.collection || existing?.collected || 0);
+    const salespersonSalesInvoiced = Number(row?.salespersonSalesInvoiced || row?.salesInvoiced || 0) || Number(existing?.salespersonSalesInvoiced || existing?.salesInvoiced || existing?.sales || 0);
+    const salespersonPoReceived =
+      Number(row?.salespersonPoReceived || row?.poReceived || 0) ||
+      Number(existing?.salespersonPoReceived || existing?.poReceived || existing?.collection || existing?.collected || 0);
+    const existingPoTotal = Number(existing?.poReceived || existing?.collection || existing?.collected || 0);
+    const existingSalespersonPo = Number(existing?.salespersonPoReceived || 0);
+    const adminCollectionDelta = Math.max(existingPoTotal - existingSalespersonPo, 0);
+    const poReceived = salespersonPoReceived + adminCollectionDelta;
     const salesInvoiceDate = normalizeDateField(
       row?.salesInvoiceDate || row?.invoiceDate || row?.salesInvoicedDate || existing?.salesInvoiceDate
     );
@@ -218,6 +261,8 @@ function mergeSalespersonFinancials(existingRows, incomingRows) {
 
     return {
       ...row,
+      salespersonSalesInvoiced,
+      salespersonPoReceived,
       salesInvoiced,
       sales: salesInvoiced,
       poReceived,
@@ -251,6 +296,7 @@ exports.upsertMyDailyReport = async (req, res) => {
     const mergedRows = existingDoc?.rows?.length
       ? mergeSalespersonFinancials(existingDoc.rows, cleanedRows)
       : cleanedRows;
+    const snapshot = await buildSalespersonSnapshot(userId);
 
     let cleanStartLocation = null;
     if (startLocation && Number.isFinite(Number(startLocation.lat)) && Number.isFinite(Number(startLocation.lng))) {
@@ -298,6 +344,10 @@ exports.upsertMyDailyReport = async (req, res) => {
       { userId, reportDateKey },
       {
         $set: setObj,
+        $setOnInsert: {
+          salespersonName: snapshot.salespersonName,
+          salespersonEmail: snapshot.salespersonEmail,
+        },
       },
       { new: true, upsert: true }
     );
@@ -322,6 +372,10 @@ exports.getMyDailyReportByDate = async (req, res) => {
     }
 
     const doc = await DailyCustomerReport.findOne({ userId, reportDateKey: date });
+    if (doc) {
+      // For salesperson, show their own poReceived and salesInvoiced, not the total
+      doc.rows = doc.rows.map(r => ({ ...r, poReceived: r.salespersonPoReceived ?? r.poReceived ?? 0, salesInvoiced: r.salespersonSalesInvoiced ?? r.salesInvoiced ?? 0 }));
+    }
     return res.json(doc || null);
   } catch (e) {
     return res.status(500).json({ message: e.message });
@@ -435,10 +489,16 @@ exports.adminAddFinanceEntry = async (req, res) => {
 
     const row = (Array.isArray(reportDoc.rows) ? reportDoc.rows : []).find((r) => String(r?._id || "") === String(rowId));
     if (!row) return res.status(404).json({ message: "Client row not found in report" });
+    const salespersonSnapshot = {
+      salespersonName: String(reportDoc.salespersonName || "").trim(),
+      salespersonEmail: String(reportDoc.salespersonEmail || "").trim(),
+    };
 
     const createdBy = req.user.id;
     const entry = await DailyReportFinanceEntry.create({
       userId,
+      salespersonName: salespersonSnapshot.salespersonName,
+      salespersonEmail: salespersonSnapshot.salespersonEmail,
       reportDateKey,
       dailyReportId: reportDoc._id,
       rowId,
@@ -479,6 +539,91 @@ exports.adminDeleteFinanceEntry = async (req, res) => {
     });
   } catch (e) {
     return res.status(500).json({ message: e.message || "Failed to delete finance entry" });
+  }
+};
+
+exports.adminUpdateNewCustomerLastDate = async (req, res) => {
+  try {
+    const {
+      userId,
+      periodType = "MONTH",
+      periodKey,
+      customerName,
+      area,
+      segment,
+      lastDateOfSales,
+    } = req.body;
+
+    if (!userId) return res.status(400).json({ message: "userId required" });
+    if (!periodKey) return res.status(400).json({ message: "periodKey required" });
+    if (!String(customerName || "").trim()) return res.status(400).json({ message: "customerName required" });
+    if (!isValidDateKey(String(lastDateOfSales || ""))) {
+      return res.status(400).json({ message: "lastDateOfSales must be YYYY-MM-DD" });
+    }
+
+    const { to } = getRange(periodType, periodKey);
+    const customerLookup = await buildCustomerLookup();
+    const historyDocs = await DailyCustomerReport.find({
+      userId: new mongoose.Types.ObjectId(userId),
+      reportDateKey: { $lte: to },
+    })
+      .select("_id rows reportDateKey")
+      .sort({ reportDateKey: -1, updatedAt: -1 })
+      .lean();
+
+    const targetName = normalizeCustomerKey(customerName);
+    const targetArea = normalizeCustomerKey(area);
+    const targetSegment = normalizeCustomerKey(segment);
+    let match = null;
+
+    for (const doc of Array.isArray(historyDocs) ? historyDocs : []) {
+      const rows = Array.isArray(doc?.rows) ? doc.rows : [];
+      for (const row of rows) {
+        const normalizedRow = enrichCustomerRow(row, customerLookup);
+        if (!normalizedRow.customerName) continue;
+        if (normalizeCustomerKey(normalizedRow.customerName) !== targetName) continue;
+        if (targetArea && normalizeCustomerKey(normalizedRow.area) !== targetArea) continue;
+        if (targetSegment && normalizeCustomerKey(normalizedRow.segment) !== targetSegment) continue;
+
+        const hasSales = Number(
+          normalizedRow.salesInvoiced ||
+            normalizedRow.sales ||
+            normalizedRow.salespersonSalesInvoiced ||
+            0
+        ) > 0;
+        if (!hasSales) continue;
+
+        match = {
+          reportId: String(doc?._id || ""),
+          rowId: String(normalizedRow._id || normalizedRow.rowId || row?._id || "").trim(),
+          reportDateKey: String(doc?.reportDateKey || "").trim(),
+        };
+        break;
+      }
+      if (match) break;
+    }
+
+    if (!match?.reportId || !match?.rowId) {
+      return res.status(404).json({ message: "Matching sales row not found" });
+    }
+
+    await DailyCustomerReport.updateOne(
+      { _id: match.reportId, "rows._id": new mongoose.Types.ObjectId(match.rowId) },
+      {
+        $set: {
+          "rows.$.salesInvoiceDate": String(lastDateOfSales).trim(),
+        },
+      }
+    );
+
+    return res.json({
+      message: "Last date of sales updated successfully",
+      reportDateKey: match.reportDateKey,
+      rowId: match.rowId,
+      lastDateOfSales: String(lastDateOfSales).trim(),
+    });
+  } catch (e) {
+    return res.status(500).json({ message: e.message || "Failed to update last date of sales" });
   }
 };
 
@@ -552,7 +697,7 @@ exports.adminListDailyReportsRange = async (req, res) => {
     }
 
     const list = await DailyCustomerReport.find(filter)
-      .select("userId reportDateKey openingKm closingKm startLocation locationTrail rows")
+      .select("userId salespersonName salespersonEmail reportDateKey openingKm closingKm startLocation locationTrail rows")
       .sort({ reportDateKey: -1 })
       .limit(safeLimit)
       .populate("userId", "name email")
@@ -573,8 +718,8 @@ exports.adminListDailyReportsRange = async (req, res) => {
       const rows = Array.isArray(r.rows) ? r.rows : [];
       const enrichedRows = rows.map((x) => enrichCustomerRow(x, customerLookup));
       const orderSum = enrichedRows.reduce((a, x) => a + Number(x.orderGenerated || 0), 0);
-      const salesInvoicedSum = enrichedRows.reduce((a, x) => a + Number(x.salesInvoiced || x.sales || 0), 0);
-      const poSum = enrichedRows.reduce((a, x) => a + Number(x.poReceived || 0), 0);
+    const salesInvoicedSum = enrichedRows.reduce((a, x) => a + Number(x.salesInvoiced || x.sales || 0), 0);
+      const poSum = enrichedRows.reduce((a, x) => a + readCollectionAmount(x), 0);
       const clientVisits = enrichedRows
         .map((x) => ({
           customerName: String(x?.customerName || "").trim(),
@@ -599,6 +744,8 @@ exports.adminListDailyReportsRange = async (req, res) => {
       return {
         _id: r._id,
         userId: r.userId,
+        salespersonName: r.salespersonName || "",
+        salespersonEmail: r.salespersonEmail || "",
         reportDateKey: r.reportDateKey,
         openingKm: r.openingKm,
         closingKm: r.closingKm,
@@ -667,7 +814,7 @@ exports.adminExportDailyReportsCSV = async (req, res) => {
     }
 
     const list = await DailyCustomerReport.find(filter)
-      .select("userId reportDateKey openingKm closingKm startLocation locationTrail rows")
+      .select("userId salespersonName salespersonEmail reportDateKey openingKm closingKm startLocation locationTrail rows")
       .sort({ reportDateKey: -1 })
       .limit(2000)
       .lean();

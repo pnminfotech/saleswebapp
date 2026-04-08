@@ -14,6 +14,8 @@ const rowSchema = new mongoose.Schema(
     salesInvoiceDate: { type: String, trim: true, default: "" }, // YYYY-MM-DD
     poReceived: { type: Number, default: 0 }, // Collection → Money received
     collectionDate: { type: String, trim: true, default: "" }, // YYYY-MM-DD
+    salespersonPoReceived: { type: Number, default: 0 },
+    salespersonSalesInvoiced: { type: Number, default: 0 },
   },
   { _id: true }
 );
@@ -21,6 +23,8 @@ const rowSchema = new mongoose.Schema(
 const dailyCustomerReportSchema = new mongoose.Schema(
   {
     userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    salespersonName: { type: String, trim: true, default: "" },
+    salespersonEmail: { type: String, trim: true, default: "" },
 
     // Store a simple key so we don't mess with timezone
     reportDateKey: { type: String, required: true }, // "YYYY-MM-DD"

@@ -16,6 +16,7 @@ const {
   adminListFinanceEntries,
   adminAddFinanceEntry,
   adminDeleteFinanceEntry,
+  adminUpdateNewCustomerLastDate,
   adminListDailyReports,
   adminListDailyReportsRange,
   adminExportDailyReportsCSV,
@@ -35,5 +36,6 @@ router.post("/admin/update", auth, requireRole("admin"), adminUpdateDailyReport)
 router.get("/admin/finance-entries", auth, requireRole("admin"), adminListFinanceEntries);
 router.post("/admin/finance-entries", auth, requireRole("admin"), adminAddFinanceEntry);
 router.delete("/admin/finance-entries/:id", auth, requireRole("admin"), adminDeleteFinanceEntry);
+router.post("/admin/new-tracking/last-date", auth, requireRole("admin"), adminUpdateNewCustomerLastDate);
 
 module.exports = router;

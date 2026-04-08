@@ -7,6 +7,7 @@ const {
   getTargetSummary,
   getOneTargetForAdmin,
   listTargetsForAdmin,
+  deleteTarget,
   upsertAnnualAndGenerate,
 } = require("../controllers/targetController");
 
@@ -15,6 +16,7 @@ router.get("/me", auth, requireRole("admin", "sales"), getMyTarget);
 router.get("/summary", auth, requireRole("admin"), getTargetSummary);
 router.get("/one", auth, requireRole("admin"), getOneTargetForAdmin);
 router.get("/admin-list", auth, requireRole("admin"), listTargetsForAdmin);
+router.delete("/:id", auth, requireRole("admin"), deleteTarget);
 router.post("/annual", auth, requireRole("admin"), upsertAnnualAndGenerate);
 
 module.exports = router;

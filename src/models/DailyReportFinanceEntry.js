@@ -3,6 +3,8 @@ const mongoose = require("mongoose");
 const dailyReportFinanceEntrySchema = new mongoose.Schema(
   {
     userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    salespersonName: { type: String, trim: true, default: "" },
+    salespersonEmail: { type: String, trim: true, default: "" },
     reportDateKey: { type: String, required: true }, // YYYY-MM-DD
     dailyReportId: { type: mongoose.Schema.Types.ObjectId, ref: "DailyCustomerReport", required: true },
     rowId: { type: mongoose.Schema.Types.ObjectId, required: true },

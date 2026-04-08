@@ -145,7 +145,10 @@ function enrichCustomerRow(row, customerLookup) {
   const salesInvoiced = Number(
     row?.salesInvoiced ?? row?.sales ?? row?.salesAmount ?? row?.invoiceAmount ?? 0
   );
-  const poReceived = Number(row?.poReceived ?? row?.collection ?? row?.collected ?? 0);
+  const poReceived = Number(row?.poReceived ?? row?.salespersonPoReceived ?? row?.collection ?? row?.collected ?? 0);
+  const salespersonPoReceived = Number(
+    row?.salespersonPoReceived ?? row?.poReceived ?? row?.collection ?? row?.collected ?? 0
+  );
 
   return {
     _id: rowId,
@@ -160,6 +163,7 @@ function enrichCustomerRow(row, customerLookup) {
     salesInvoiced,
     sales: salesInvoiced,
     segment: String(row?.segment || found?.segment || "").trim(),
+    salespersonPoReceived,
     poReceived,
     salesInvoiceDate: String(row?.salesInvoiceDate || row?.invoiceDate || row?.salesInvoicedDate || "").trim(),
     collectionDate: String(row?.collectionDate || row?.poReceivedDate || row?.receivedDate || "").trim(),
@@ -845,7 +849,11 @@ exports.adminPerformanceReport = async (req, res) => {
           },
           collection: {
             $sum: {
-              $map: { input: { $ifNull: ["$rows", []] }, as: "r", in: { $ifNull: ["$$r.poReceived", 0] } }
+              $map: {
+                input: { $ifNull: ["$rows", []] },
+                as: "r",
+                in: { $ifNull: ["$$r.poReceived", { $ifNull: ["$$r.salespersonPoReceived", 0] }] }
+              }
             }
           }
         }
@@ -948,7 +956,9 @@ exports.adminPerformanceReport = async (req, res) => {
 
 exports.adminCustomerWiseReport = async (req, res) => {
   try {
-    const { userId, periodType = "MONTH", periodKey, segment } = req.query;
+    const { userId, periodType = "MONTH", periodKey, segment, view } = req.query;
+    const reportView = String(view || "clients").trim().toLowerCase();
+    const isNewCustomerView = ["new", "tracking", "newcustomer", "new-customer"].includes(reportView);
 
     if (!userId) return res.status(400).json({ message: "userId required" });
     if (!periodKey) return res.status(400).json({ message: "periodKey required" });
@@ -962,6 +972,12 @@ exports.adminCustomerWiseReport = async (req, res) => {
     };
 
     const periodDocs = await DailyCustomerReport.find(match).select("_id rows").lean();
+    const historyDocs = await DailyCustomerReport.find({
+      userId: new mongoose.Types.ObjectId(userId),
+      reportDateKey: { $lte: to },
+    })
+      .select("_id rows reportDateKey")
+      .lean();
 
     const rowContextMap = new Map();
     const customerMap = new Map();
@@ -991,6 +1007,7 @@ exports.adminCustomerWiseReport = async (req, res) => {
             segment: normalizedRow.segment,
             orderGenerated: 0,
             salesInvoiced: 0,
+            sales: 0,
             collection: 0,
             visits: 0,
           });
@@ -1005,9 +1022,20 @@ exports.adminCustomerWiseReport = async (req, res) => {
 
         rowContexts.push({
           customerKey: key,
+          customerName: normalizedRow.customerName,
+          area: normalizedRow.area,
+          segment: normalizedRow.segment,
+          reportDateKey: String(doc?.reportDateKey || "").trim(),
+          newOrExisting: normalizedRow.newOrExisting,
+          enquiryMode: normalizedRow.enquiryMode,
+          salesInvoiceDate: normalizedRow.salesInvoiceDate,
+          collectionDate: normalizedRow.collectionDate,
+          orderGenerated: Number(normalizedRow.orderGenerated || 0),
           reportKey: financeRowKey,
+          baseSalesInvoiced: Number(normalizedRow.salespersonSalesInvoiced || 0),
           fallbackSalesInvoiced: Number(normalizedRow.salesInvoiced || normalizedRow.sales || 0),
-          fallbackCollection: Number(normalizedRow.poReceived || 0),
+          baseCollection: Number(normalizedRow.salespersonPoReceived || 0),
+          fallbackCollection: Number(normalizedRow.poReceived || normalizedRow.collection || 0),
         });
       }
     }
@@ -1063,47 +1091,210 @@ exports.adminCustomerWiseReport = async (req, res) => {
       financeByRow.set(financeRowKey, current);
     }
 
+    const rowTotalsByReportKey = new Map();
+    for (const ctx of rowContexts) {
+      const finance = financeByRow.get(ctx.reportKey);
+      const adminSales = Number(finance?.salesInvoiced || 0);
+      const adminCollection = Number(finance?.collection || 0);
+      const salespersonSales = Number(ctx.baseSalesInvoiced || 0);
+      const storedSales = Number(ctx.fallbackSalesInvoiced || 0);
+      const salespersonCollection = Number(ctx.baseCollection || 0);
+      const storedCollection = Number(ctx.fallbackCollection || 0);
+
+      const salesTotal =
+        salespersonSales > 0 || adminSales > 0 ? salespersonSales + adminSales : storedSales;
+      const collectionTotal =
+        salespersonCollection > 0 || adminCollection > 0
+          ? salespersonCollection + adminCollection
+          : storedCollection;
+
+      rowTotalsByReportKey.set(ctx.reportKey, {
+        salesTotal,
+        collectionTotal,
+      });
+    }
+
     for (const ctx of rowContexts) {
       const item = customerMap.get(ctx.customerKey);
       if (!item) continue;
-      const finance = financeByRow.get(ctx.reportKey);
-      if (!finance) {
-        const salesInvoiced = Number(ctx.fallbackSalesInvoiced || 0);
-        const collection = Number(ctx.fallbackCollection || 0);
-        item.salesInvoiced += salesInvoiced;
-        item.sales += salesInvoiced;
-        item.collection += collection;
-      }
+      const totals = rowTotalsByReportKey.get(ctx.reportKey) || {};
+      const salesTotal = Number(totals.salesTotal || 0);
+      const collectionTotal = Number(totals.collectionTotal || 0);
+
+      item.salesInvoiced += salesTotal;
+      item.sales += salesTotal;
+      item.collection += collectionTotal;
     }
 
-    for (const entry of financeEntries) {
-      const financeRowKey = `${String(entry?.dailyReportId || "")}|${String(entry?.rowId || "")}`;
-      const rowContext = rowContextMap.get(financeRowKey);
-      if (!rowContext) continue;
-      if (segment && normalizeKey(rowContext.segment) !== normalizeKey(segment)) continue;
+    if (isNewCustomerView) {
+      const trackingMap = new Map();
+      const historyCustomerMap = new Map();
+      const firstVisitDateByCustomer = new Map();
+      const latestDateByCustomer = new Map();
+      const firstOrderInfoByCustomer = new Map();
 
-      const key = getCustomerKey(rowContext.customerName, rowContext.area);
-      if (!customerMap.has(key)) {
-        customerMap.set(key, {
-          key: normalizeKey(rowContext.customerName),
-          customerName: rowContext.customerName,
-          area: rowContext.area,
-          segment: rowContext.segment,
-          orderGenerated: 0,
-          salesInvoiced: 0,
-          collection: 0,
-          visits: 0,
+      const isEarlier = (left, right) => {
+        const a = String(left || "").trim();
+        const b = String(right || "").trim();
+        if (!a) return false;
+        if (!b) return true;
+        return a.localeCompare(b) < 0;
+      };
+
+      const isLater = (left, right) => {
+        const a = String(left || "").trim();
+        const b = String(right || "").trim();
+        if (!a) return false;
+        if (!b) return true;
+        return a.localeCompare(b) > 0;
+      };
+
+      const buildHistoryIndexes = (docs, { collectTrackingSeed = false } = {}) => {
+        for (const doc of Array.isArray(docs) ? docs : []) {
+          const rows = Array.isArray(doc?.rows) ? doc.rows : [];
+          for (const row of rows) {
+            const normalizedRow = enrichCustomerRow(row, customerLookup);
+            if (!normalizedRow.customerName) continue;
+            if (segment && normalizeKey(normalizedRow.segment) !== normalizeKey(segment)) continue;
+
+            const key = `${normalizeKey(normalizedRow.customerName)}|${normalizeKey(normalizedRow.area)}`;
+            if (!historyCustomerMap.has(key)) {
+              historyCustomerMap.set(key, {
+                customerKey: key,
+                customerName: normalizedRow.customerName,
+                area: normalizedRow.area,
+                segment: normalizedRow.segment,
+                orderGenerated: 0,
+                salesInvoiced: 0,
+                sales: 0,
+                collection: 0,
+                visits: 0,
+              });
+            }
+
+            const item = historyCustomerMap.get(key);
+            item.area = item.area || normalizedRow.area;
+            item.segment = item.segment || normalizedRow.segment;
+            item.orderGenerated += Number(normalizedRow.orderGenerated || 0);
+            item.salesInvoiced += Number(normalizedRow.salesInvoiced || normalizedRow.sales || 0);
+            item.sales += Number(normalizedRow.salesInvoiced || normalizedRow.sales || 0);
+            item.collection += Number(normalizedRow.poReceived || normalizedRow.salespersonPoReceived || 0);
+            item.visits += 1;
+
+            const visitRaw = String(doc?.reportDateKey || "").trim();
+            if (visitRaw) {
+              const prevVisit = firstVisitDateByCustomer.get(key) || "";
+              if (!prevVisit || isEarlier(visitRaw, prevVisit)) firstVisitDateByCustomer.set(key, visitRaw);
+            }
+
+            const latestRaw = String(normalizedRow.salesInvoiceDate || "").trim();
+            if (latestRaw) {
+              const prevLatest = latestDateByCustomer.get(key) || "";
+              if (isLater(latestRaw, prevLatest)) latestDateByCustomer.set(key, latestRaw);
+            }
+
+            if (Number(normalizedRow.orderGenerated || 0) > 0) {
+              const orderRaw = String(doc?.reportDateKey || "").trim();
+              const prevOrder = firstOrderInfoByCustomer.get(key) || null;
+              if (!prevOrder || isEarlier(orderRaw, prevOrder.date)) {
+                firstOrderInfoByCustomer.set(key, {
+                  date: orderRaw,
+                  amount: Number(normalizedRow.orderGenerated || 0),
+                });
+              }
+            }
+
+            if (!collectTrackingSeed) continue;
+          }
+        }
+      };
+
+      buildHistoryIndexes(historyDocs);
+
+      for (const ctx of rowContexts) {
+        if (String(ctx.newOrExisting || "").trim() !== "New") continue;
+        const key = `${ctx.customerKey}|${normalizeKey(ctx.area)}|${normalizeKey(ctx.segment)}`;
+        if (!trackingMap.has(key)) {
+          trackingMap.set(key, {
+            _id: key,
+            customerKey: ctx.customerKey,
+            customerName: ctx.customerName,
+            area: ctx.area || "-",
+            segment: ctx.segment || "-",
+            dateOfEnquiry: "",
+            modeOfEnquiry: ctx.enquiryMode || "",
+            poReceivedDate: "",
+            poValue: 0,
+            lastDateOfSales: "",
+            totalSalesTillDate: 0,
+            totalCollectionTillDate: 0,
+            pendingSales: 0,
+            visits: 0,
+          });
+        }
+      }
+
+      const trackingItems = Array.from(trackingMap.values())
+        .sort((a, b) => {
+          if (a.dateOfEnquiry !== b.dateOfEnquiry) return String(a.dateOfEnquiry || "").localeCompare(String(b.dateOfEnquiry || ""));
+          return String(a.customerName || "").localeCompare(String(b.customerName || ""));
+        })
+        .map((item) => {
+          const totals = historyCustomerMap.get(item.customerKey) || {};
+          const totalSalesTillDate = Number(totals.salesInvoiced || 0);
+          const totalCollectionTillDate = Number(totals.collection || 0);
+          const visits = Number(totals.visits || 0) || Number(item.visits || 0);
+          const dateOfEnquiry = firstVisitDateByCustomer.get(item.customerKey) || item.dateOfEnquiry || "";
+          const lastDateOfSales = latestDateByCustomer.get(item.customerKey) || item.lastDateOfSales || "";
+          const firstOrder = firstOrderInfoByCustomer.get(item.customerKey) || null;
+          const poValue = Number(firstOrder?.amount || totals.orderGenerated || item.poValue || 0);
+          const poReceivedDate = String(firstOrder?.date || item.poReceivedDate || "").trim();
+
+          return {
+            ...item,
+            visits,
+            dateOfEnquiry,
+            poReceivedDate,
+            lastDateOfSales,
+            poValue,
+            totalSalesTillDate,
+            totalCollectionTillDate,
+            pendingSales: Math.max(poValue - totalSalesTillDate, 0),
+            salesInvoiced: totalSalesTillDate,
+            sales: totalSalesTillDate,
+            collection: totalCollectionTillDate,
+          };
         });
-      }
 
-      const item = customerMap.get(key);
-      const amount = Number(entry.amount || 0);
-      if (String(entry.type) === "INVOICE") {
-        item.salesInvoiced += amount;
-        item.sales += amount;
-      } else if (String(entry.type) === "COLLECTION") {
-        item.collection += amount;
-      }
+      const summary = trackingItems.reduce(
+        (acc, item) => {
+          acc.count += 1;
+          acc.totalPoValue += Number(item.poValue || 0);
+          acc.totalSalesTillDate += Number(item.totalSalesTillDate || 0);
+          acc.totalCollectionTillDate += Number(item.totalCollectionTillDate || 0);
+          acc.totalPendingSales += Number(item.pendingSales || 0);
+          acc.totalVisits += Number(item.visits || 0);
+          return acc;
+        },
+        {
+          count: 0,
+          totalPoValue: 0,
+          totalSalesTillDate: 0,
+          totalCollectionTillDate: 0,
+          totalPendingSales: 0,
+          totalVisits: 0,
+        }
+      );
+
+      return res.json({
+        periodType,
+        periodKey,
+        from,
+        to,
+        view: "new",
+        items: trackingItems,
+        summary,
+      });
     }
 
     const list = Array.from(customerMap.values())
@@ -1112,18 +1303,32 @@ exports.adminCustomerWiseReport = async (req, res) => {
         return String(a.customerName || "").localeCompare(String(b.customerName || ""));
       })
       .map((item) => ({
-        _id: item.key,
+        _id: `${item.key}|${normalizeKey(item.area)}`,
+        customerKey: item.key,
         area: item.area,
         segment: item.segment,
         orderGenerated: item.orderGenerated,
         salesInvoiced: item.salesInvoiced,
-        sales: item.sales,
+        sales: item.salesInvoiced,
         collection: item.collection,
         visits: item.visits,
         customerName: item.customerName,
       }));
 
-    return res.json({ periodType, periodKey, from, to, items: list });
+    return res.json({
+      periodType,
+      periodKey,
+      from,
+      to,
+      view: "clients",
+      items: list,
+      summary: {
+        count: list.length,
+        totalVisits: list.reduce((acc, item) => acc + Number(item.visits || 0), 0),
+        totalSalesInvoiced: list.reduce((acc, item) => acc + Number(item.salesInvoiced || 0), 0),
+        totalCollection: list.reduce((acc, item) => acc + Number(item.collection || 0), 0),
+      },
+    });
   } catch (e) {
     return res.status(500).json({ message: e.message || "Failed" });
   }
@@ -1171,7 +1376,7 @@ exports.adminLeadConversionReport = async (req, res) => {
         const customerKey = normalizeKey(customerName);
         const order = Number(r?.orderGenerated || 0);
         const sales = Number(r?.salesInvoiced || 0);
-        const collection = Number(r?.poReceived || 0);
+        const collection = Number(r?.poReceived ?? r?.salespersonPoReceived ?? 0);
         const mode = String(r?.enquiryMode || "").trim();
         agg.salesInvoiced += sales;
 
@@ -1292,7 +1497,12 @@ exports.myCustomerCollectionTracker = async (req, res) => {
           area: { $trim: { input: { $ifNull: ["$rows.area", ""] } } },
           orderGenerated: { $ifNull: ["$rows.orderGenerated", 0] },
           salesInvoiced: { $ifNull: ["$rows.salesInvoiced", 0] },
-          collection: { $ifNull: ["$rows.poReceived", 0] }
+          collection: {
+            $ifNull: [
+              "$rows.poReceived",
+              { $ifNull: ["$rows.salespersonPoReceived", 0] }
+            ]
+          }
         }
       },
       { $match: { customerName: { $ne: "" } } },

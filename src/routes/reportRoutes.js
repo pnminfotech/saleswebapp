@@ -84,6 +84,7 @@ const authModule = require("../middleware/auth");
 const { requireRole } = require("../middleware/requireRole");
 const reportController = require("../controllers/reportController");
 const { resolveTargetRows, summarizeTargetRows } = require("../utils/targetRollup");
+const { buildCustomerLookupMap, buildCustomerSelectFields } = require("../utils/customerMaster");
 
 const auth = typeof authModule === "function" ? authModule : authModule.auth;
 
@@ -108,41 +109,42 @@ function monthRange(yyyyMM) {
 
 function quarterRange(qKey) {
   const raw = String(qKey || "").toUpperCase().trim();
-  const fy = raw.match(/^FY(\d{4})-Q([1-4])$/);
+  const fy = raw.match(/^(?:FY\s*)?(\d{4})-Q([1-4])$/);
+  const cy = raw.match(/^CY\s*(\d{4})-Q([1-4])$/);
 
-  if (fy) {
-    const fyStart = Number(fy[1]);
-    const q = Number(fy[2]);
+  if (fy || cy) {
+    const fyStart = Number((fy || cy)[1]);
+    const q = Number((fy || cy)[2]);
     if (q === 1) return { startKey: `${fyStart}-04-01`, endKey: `${fyStart}-07-01` };
     if (q === 2) return { startKey: `${fyStart}-07-01`, endKey: `${fyStart}-10-01` };
     if (q === 3) return { startKey: `${fyStart}-10-01`, endKey: `${fyStart + 1}-01-01` };
     return { startKey: `${fyStart + 1}-01-01`, endKey: `${fyStart + 1}-04-01` };
   }
 
-  // backward compatibility: "2026-Q1"
+  // backward compatibility: plain "2026-Q1" now means FY2026-27
   const [yStr, qStr] = raw.split("-");
   const y = Number(yStr);
   const q = Number(String(qStr || "").replace("Q", ""));
-  const startMonth = (q - 1) * 3 + 1;
-  const startKey = `${y}-${String(startMonth).padStart(2, "0")}-01`;
+  const startMonth = q === 1 ? 4 : q === 2 ? 7 : q === 3 ? 10 : 1;
+  const startYear = q === 4 ? y + 1 : y;
   const endMonth = startMonth + 3;
-  const endY = endMonth > 12 ? y + 1 : y;
+  const endY = endMonth > 12 ? startYear + 1 : startYear;
   const endM = endMonth > 12 ? endMonth - 12 : endMonth;
   const endKey = `${endY}-${String(endM).padStart(2, "0")}-01`;
-  return { startKey, endKey };
+  return { startKey: `${startYear}-${String(startMonth).padStart(2, "0")}-01`, endKey };
 }
 
 function yearRange(yKey) {
   const raw = String(yKey || "").toUpperCase().trim();
 
-  // FY2026 => Apr 1, 2026 to Apr 1, 2027
-  const fy = raw.match(/^FY(\d{4})$/);
+  // FY2026 or plain 2026 => Apr 1, 2026 to Apr 1, 2027
+  const fy = raw.match(/^(?:FY\s*)?(\d{4})(?:\s*[-/]\s*\d{2,4})?$/);
   if (fy) {
     const y = Number(fy[1]);
     return { startKey: `${y}-04-01`, endKey: `${y + 1}-04-01` };
   }
 
-  // CY2026 or 2026 => Jan 1, 2026 to Jan 1, 2027
+  // CY2026 => Jan 1, 2026 to Jan 1, 2027
   const cy = raw.match(/^CY(\d{4})$/);
   const y = Number(cy ? cy[1] : raw);
   return { startKey: `${y}-01-01`, endKey: `${y + 1}-01-01` };
@@ -167,19 +169,8 @@ function toTitleCase(value) {
 }
 
 async function buildCustomerSegmentLookup() {
-  const customers = await Customer.find({}).select("name segment area").lean();
-  const map = new Map();
-
-  for (const customer of customers) {
-    const key = normalizeSegmentKey(customer?.name);
-    if (!key || map.has(key)) continue;
-    map.set(key, {
-      segment: String(customer?.segment || "").trim(),
-      area: String(customer?.area || "").trim(),
-    });
-  }
-
-  return map;
+  const customers = await Customer.find({}).select(buildCustomerSelectFields()).lean();
+  return buildCustomerLookupMap(customers);
 }
 
 router.get("/performance/me", auth, async (req, res) => {
@@ -238,7 +229,9 @@ router.get("/performance/me", auth, async (req, res) => {
               $map: {
                 input: { $ifNull: ["$rows", []] },
                 as: "r",
-                in: { $ifNull: ["$$r.salesInvoiced", 0] },
+                in: {
+                  $ifNull: ["$$r.salesInvoiced", 0],
+                },
               },
             },
           },
@@ -336,7 +329,9 @@ router.get("/performance/me/segments", auth, async (req, res) => {
             },
             newOrExisting: { $ifNull: ["$rows.newOrExisting", "Existing"] },
             orderGenerated: { $ifNull: ["$rows.orderGenerated", 0] },
-            salesInvoiced: { $ifNull: ["$rows.salesInvoiced", { $ifNull: ["$rows.sales", 0] }] },
+            salesInvoiced: {
+              $ifNull: ["$rows.salesInvoiced", 0],
+            },
             collection: { $ifNull: ["$rows.poReceived", 0] },
           },
         },

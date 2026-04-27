@@ -2,6 +2,7 @@ const Target = require("../models/Target");
 const User = require("../models/User");
 const { upsertTargetSchema } = require("../utils/validators");
 const { resolveTargetRows, summarizeTargetRows } = require("../utils/targetRollup");
+const { buildTargetContext, validateTargetWrite, TARGET_FIELDS } = require("../utils/targetValidation");
 
 const CompanySettings = require("../models/CompanySettings");
 
@@ -32,6 +33,21 @@ async function upsertTarget(req, res) {
   if (!parsed.success) return res.status(400).json({ message: "Invalid input" });
 
   const d = parsed.data;
+  const validation = await validateTargetWrite({
+    userId: d.userId,
+    segmentId: d.segmentId,
+    periodType: d.periodType,
+    periodKey: d.periodKey,
+    values: d,
+  });
+
+  if (!validation.ok) {
+    return res.status(400).json({
+      message: validation.errors[0] || "Target values are not valid for this period",
+      errors: validation.errors,
+    });
+  }
+
   const snapshot = await buildSalespersonSnapshot(d.userId);
 
   const doc = await Target.findOneAndUpdate(
@@ -41,7 +57,8 @@ async function upsertTarget(req, res) {
         vendorVisitTarget: d.vendorVisitTarget ?? 0,
         newVendorTarget: d.newVendorTarget ?? 0,
         salesTarget: d.salesTarget ?? 0,
-        collectionTarget: d.collectionTarget ?? 0
+        collectionTarget: d.collectionTarget ?? 0,
+        periodBasis: "FISCAL",
       },
       $setOnInsert: {
         salespersonName: snapshot.salespersonName,
@@ -86,6 +103,30 @@ async function getTargetSummary(req, res) {
     return res.status(500).json({ message: e.message || "Failed to load target summary" });
   }
 }
+
+async function getTargetContext(req, res) {
+  try {
+    const { userId, segmentId, periodType = "MONTH", periodKey } = req.query;
+    if (!userId || !segmentId || !periodKey) {
+      return res.status(400).json({ message: "userId, segmentId, periodKey are required" });
+    }
+
+    const context = await buildTargetContext({
+      userId,
+      segmentId,
+      periodType,
+      periodKey,
+    });
+
+    return res.json({
+      ...context,
+      fields: TARGET_FIELDS,
+    });
+  } catch (e) {
+    return res.status(500).json({ message: e.message || "Failed to load target context" });
+  }
+}
+
 async function getOneTargetForAdmin(req, res) {
   try {
     const { userId, segmentId, periodType, periodKey } = req.query;
@@ -153,6 +194,7 @@ async function upsertChild({ userId, periodType, periodKey, parentKey, data, ove
     existing.collectionTarget = data.collectionTarget ?? 0;
     existing.salespersonName = existing.salespersonName || snapshot.salespersonName;
     existing.salespersonEmail = existing.salespersonEmail || snapshot.salespersonEmail;
+    existing.periodBasis = "FISCAL";
     existing.source = "AUTO";
     existing.parentKey = parentKey;
     return existing.save();
@@ -164,6 +206,7 @@ async function upsertChild({ userId, periodType, periodKey, parentKey, data, ove
     salespersonEmail: snapshot.salespersonEmail,
     periodType,
     periodKey,
+    periodBasis: "FISCAL",
     ...data,
     source: "AUTO",
     parentKey
@@ -174,7 +217,7 @@ async function upsertAnnualAndGenerate(req, res) {
   try {
     const {
       userId,
-      yearKey, // FY2025-26 or CY2026
+      yearKey, // FY2025-26, CY2026, or plain 2026 (FY start year)
       vendorVisitTarget = 0,
       newVendorTarget = 0,
       salesTarget = 0,
@@ -197,6 +240,7 @@ async function upsertAnnualAndGenerate(req, res) {
           newVendorTarget: Number(newVendorTarget || 0),
           salesTarget: Number(salesTarget || 0),
           collectionTarget: Number(collectionTarget || 0),
+          periodBasis: "FISCAL",
           source: "MANUAL",
           parentKey: "",
           salespersonName: snapshot.salespersonName,
@@ -229,19 +273,21 @@ async function upsertAnnualAndGenerate(req, res) {
       collectionTarget: Math.round(Number(collectionTarget || 0) / 12),
     };
 
-    // Quarter keys depend on yearType:
-    // - FY2025-26-Q1..Q4
-    // - CY2026-Q1..Q4
+    const isCalendarYear = String(yearKey || "").trim().toUpperCase().startsWith("CY");
+    const yearStart = Number(String(yearKey || "").trim().replace(/^(FY|CY)/i, "").slice(0, 4));
+
+    // Quarter keys remain the same shape, but FY/Q1 now means Apr-Jun.
     const qKeys = ["Q1", "Q2", "Q3", "Q4"].map((q) => `${yearKey}-${q}`);
 
-    const monthKeys =
-      yearKey.startsWith("FY")
-        ? Array.from({ length: 12 }, (_, i) => `${yearKey}-${String(i + 1).padStart(2, "0")}`) // FY2025-26-01..12
-        : Array.from({ length: 12 }, (_, i) => {
-            // CY2026 => 2026-01..12
-            const yr = Number(yearKey.replace("CY", ""));
-            return `${yr}-${String(i + 1).padStart(2, "0")}`;
-          });
+    const monthKeys = isCalendarYear
+      ? Array.from({ length: 12 }, (_, i) => {
+          const yr = yearStart;
+          return `${yr}-${String(i + 1).padStart(2, "0")}`;
+        })
+      : [
+          ...Array.from({ length: 9 }, (_, i) => `${yearStart}-${String(i + 4).padStart(2, "0")}`),
+          ...Array.from({ length: 3 }, (_, i) => `${yearStart + 1}-${String(i + 1).padStart(2, "0")}`),
+        ];
 
     await Promise.all(
       qKeys.map((k) =>
@@ -280,6 +326,7 @@ module.exports = {
   upsertTarget,
   getMyTarget,
   getTargetSummary,
+  getTargetContext,
   getOneTargetForAdmin,
   listTargetsForAdmin,
   deleteTarget,

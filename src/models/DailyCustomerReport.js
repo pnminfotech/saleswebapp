@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const rowSchema = new mongoose.Schema(
   {
     customerName: { type: String, required: true, trim: true },
+    customerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", default: null },
     newOrExisting: { type: String, enum: ["New", "Existing"], default: "Existing" },
     area: { type: String, trim: true },
     metTo: { type: String, trim: true }, // Mr/Mrs/Miss

@@ -18,22 +18,23 @@ function getRange(periodType, periodKey){
 
   if(pt === "QUARTER"){
     const raw = String(periodKey || "").toUpperCase().trim();
-    const fy = raw.match(/^FY(\d{4})-Q([1-4])$/);
+    const fy = raw.match(/^(?:FY\s*)?(\d{4})-Q([1-4])$/);
+    const cy = raw.match(/^CY\s*(\d{4})-Q([1-4])$/);
 
     let fromD;
     let toD;
 
-    if (fy) {
-      // FY2026-Q1 => Apr-Jun 2026 ... FY2026-Q4 => Jan-Mar 2027
-      const fyStart = Number(fy[1]);
-      const q = Number(fy[2]);
+    if (fy || cy) {
+      // FY2026-Q1 or 2026-Q1 => Apr-Jun 2026 ... Q4 => Jan-Mar next year
+      const fyStart = Number((fy || cy)[1]);
+      const q = Number((fy || cy)[2]);
       const startMonth = q === 1 ? 3 : q === 2 ? 6 : q === 3 ? 9 : 0;
       const startYear = q === 4 ? fyStart + 1 : fyStart;
       fromD = new Date(startYear, startMonth, 1);
       toD = new Date(startYear, startMonth + 3, 0);
     } else {
-      // backward compatibility: 2026-Q1 (calendar quarter)
-      const [yStr, qStr] = raw.split("-Q");
+      // backward compatibility: CY2026-Q1 (calendar quarter)
+      const [yStr, qStr] = raw.replace(/^FY\s*/i, "").replace(/^CY\s*/i, "").split("-Q");
       const y = Number(yStr);
       const q = Number(qStr); // 1..4
       const startMonth = (q-1)*3; // 0,3,6,9
@@ -46,8 +47,8 @@ function getRange(periodType, periodKey){
 
   if(pt === "YEAR"){
     const raw = String(periodKey || "").toUpperCase().trim();
-    const fy = raw.match(/^FY(\d{4})$/);
-    const cy = raw.match(/^CY(\d{4})$/);
+    const fy = raw.match(/^(?:FY\s*)?(\d{4})(?:\s*[-/]\s*\d{2,4})?$/);
+    const cy = raw.match(/^CY\s*(\d{4})$/);
 
     let fromD;
     let toD;

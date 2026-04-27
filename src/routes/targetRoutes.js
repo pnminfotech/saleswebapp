@@ -5,6 +5,7 @@ const {
   upsertTarget,
   getMyTarget,
   getTargetSummary,
+  getTargetContext,
   getOneTargetForAdmin,
   listTargetsForAdmin,
   deleteTarget,
@@ -14,6 +15,7 @@ const {
 router.post("/", auth, requireRole("admin"), upsertTarget);
 router.get("/me", auth, requireRole("admin", "sales"), getMyTarget);
 router.get("/summary", auth, requireRole("admin"), getTargetSummary);
+router.get("/context", auth, requireRole("admin"), getTargetContext);
 router.get("/one", auth, requireRole("admin"), getOneTargetForAdmin);
 router.get("/admin-list", auth, requireRole("admin"), listTargetsForAdmin);
 router.delete("/:id", auth, requireRole("admin"), deleteTarget);

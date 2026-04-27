@@ -4,6 +4,15 @@ const DailyCustomerReport = require("../models/DailyCustomerReport");
 const Customer = require("../models/Customer");
 const User = require("../models/User");
 const DailyReportFinanceEntry = require("../models/DailyReportFinanceEntry");
+const {
+  buildCustomerLookupMap,
+  buildCustomerSelectFields,
+  normalizeCustomerKey,
+  normalizeClientType,
+  upsertCustomerByName,
+  upsertCustomerByPreviousName,
+  toTitleCase,
+} = require("../utils/customerMaster");
 const { getRange } = require("../utils/period");
 
 function isValidDateKey(s) {
@@ -19,6 +28,31 @@ function readCollectionAmount(row = {}) {
   return Number(row?.poReceived ?? row?.salespersonPoReceived ?? row?.collection ?? row?.collected ?? 0);
 }
 
+function readSalesAmount(row = {}) {
+  return Number(row?.salespersonSalesInvoiced ?? row?.orderGenerated ?? 0);
+}
+
+const ENQUIRY_MODE_OPTIONS = new Set([
+  "Direct",
+  "Supplier",
+  "Existing Customer",
+  "Online",
+  "Other",
+]);
+
+function normalizeEnquiryMode(value) {
+  const text = toTitleCase(value);
+  if (!text) return "";
+  if (ENQUIRY_MODE_OPTIONS.has(text)) return text;
+  const lowered = text.toLowerCase();
+  if (lowered.includes("direct")) return "Direct";
+  if (lowered.includes("supplier")) return "Supplier";
+  if (lowered.includes("existing")) return "Existing Customer";
+  if (lowered.includes("online")) return "Online";
+  if (lowered.includes("other")) return "Other";
+  return "Other";
+}
+
 async function buildSalespersonSnapshot(userId) {
   if (!userId) return { salespersonName: "", salespersonEmail: "" };
   const user = await User.findById(userId).select("name email").lean();
@@ -28,97 +62,136 @@ async function buildSalespersonSnapshot(userId) {
   };
 }
 
-async function rebuildFinanceTotalsForReport(reportDoc) {
-  if (!reportDoc) return null;
-
-  const entries = await DailyReportFinanceEntry.find({
-    dailyReportId: reportDoc._id,
-  })
+async function getFinanceEntriesForReport(reportDoc) {
+  if (!reportDoc?._id) return [];
+  return DailyReportFinanceEntry.find({ dailyReportId: reportDoc._id })
     .sort({ entryDate: 1, createdAt: 1 })
     .lean();
+}
 
-  const rows = Array.isArray(reportDoc.rows) ? reportDoc.rows : [];
-  const nextRows = rows.map((row) => {
+function indexFinanceEntriesByReport(entries) {
+  const map = new Map();
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const reportId = String(entry?.dailyReportId || "").trim();
+    if (!reportId) continue;
+    const list = map.get(reportId) || [];
+    list.push(entry);
+    map.set(reportId, list);
+  }
+  return map;
+}
+
+function applyFinanceTotalsToRows(rows, entries) {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  const safeEntries = Array.isArray(entries) ? entries : [];
+
+  return safeRows.map((row) => {
     const rowId = String(row?._id || "");
-    const rowEntries = entries.filter((entry) => String(entry?.rowId || "") === rowId);
+    const rowEntries = safeEntries.filter((entry) => String(entry?.rowId || "") === rowId);
     const invoiceEntries = rowEntries.filter((entry) => entry.type === "INVOICE");
     const collectionEntries = rowEntries.filter((entry) => entry.type === "COLLECTION");
     const adminSalesInvoiced = invoiceEntries.reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
-    const salespersonSalesInvoiced = Number(row?.salespersonSalesInvoiced ?? 0);
-    const salesInvoiced = salespersonSalesInvoiced + adminSalesInvoiced;
+    const salespersonSalesInvoiced = readSalesAmount(row);
     const salespersonPoReceived = Number(
       row?.salespersonPoReceived ?? row?.poReceived ?? row?.collection ?? row?.collected ?? 0
     );
     const adminCollection = collectionEntries.reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
-    const poReceived = salespersonPoReceived + adminCollection;
-    const salesInvoiceDate = invoiceEntries.length ? String(invoiceEntries[invoiceEntries.length - 1].entryDate || "") : "";
-    const collectionDate = collectionEntries.length ? String(collectionEntries[collectionEntries.length - 1].entryDate || "") : "";
 
     return {
       ...row,
+      orderGenerated: salespersonSalesInvoiced || Number(row?.orderGenerated || 0),
       salespersonPoReceived,
-      salesInvoiced,
-      sales: salesInvoiced,
-      salesInvoiceDate,
-      poReceived,
-      collectionDate,
+      salespersonSalesInvoiced,
+      salesInvoiced: adminSalesInvoiced,
+      sales: adminSalesInvoiced,
+      salesInvoiceDate: invoiceEntries.length ? String(invoiceEntries[invoiceEntries.length - 1].entryDate || "") : "",
+      poReceived: salespersonPoReceived + adminCollection,
+      collectionDate: collectionEntries.length
+        ? String(collectionEntries[collectionEntries.length - 1].entryDate || "")
+        : "",
     };
   });
+}
+
+async function rebuildFinanceTotalsForReport(reportDoc) {
+  if (!reportDoc) return null;
+
+  const entries = await getFinanceEntriesForReport(reportDoc);
+  const nextRows = applyFinanceTotalsToRows(reportDoc.rows, entries);
 
   reportDoc.rows = nextRows;
   await reportDoc.save();
   return { report: reportDoc, entries };
 }
 
-function normalizeCustomerKey(value) {
-  return String(value || "").trim().toLowerCase();
+function findDuplicateCustomerRow(rows) {
+  const seen = new Map();
+
+  for (let index = 0; index < (Array.isArray(rows) ? rows.length : 0); index++) {
+    const row = rows[index] || {};
+    const key = normalizeCustomerKey(row.customerName);
+    if (!key) continue;
+
+    if (seen.has(key)) {
+      const firstIndex = seen.get(key);
+      return {
+        customerName: String(row.customerName || "").trim(),
+        firstIndex,
+        duplicateIndex: index,
+      };
+    }
+
+    seen.set(key, index);
+  }
+
+  return null;
+}
+
+function buildDuplicateCustomerMessage(duplicate) {
+  if (!duplicate) return "";
+  const name = duplicate.customerName || "client";
+  return `Duplicate client "${name}" found in rows ${duplicate.firstIndex + 1} and ${duplicate.duplicateIndex + 1}. Each client can appear only once per report.`;
 }
 
 async function buildCustomerLookup() {
-  const customers = await Customer.find({}).select("name area segment").lean();
-  const map = new Map();
-
-  for (const customer of customers) {
-    const key = String(customer?.name || "").trim().toLowerCase();
-    if (!key || map.has(key)) continue;
-    map.set(key, {
-      area: String(customer?.area || "").trim(),
-      segment: String(customer?.segment || "").trim(),
-    });
-  }
-
-  return map;
+  const customers = await Customer.find({}).select(buildCustomerSelectFields()).lean();
+  return buildCustomerLookupMap(customers);
 }
 
 function enrichCustomerRow(row, customerLookup) {
   const rowId = String(row?._id || row?.rowId || "").trim();
-  const name = String(row?.customerName || "").trim();
-  const found = customerLookup.get(name.toLowerCase());
+  const name = toTitleCase(row?.customerName);
+  const customerId = String(row?.customerId || "").trim();
+  const found =
+    (customerId ? customerLookup.get(`id:${customerId}`) : null) ||
+    customerLookup.get(normalizeCustomerKey(name));
   const orderGenerated = Number(
     row?.orderGenerated ?? row?.order ?? row?.orderValue ?? row?.orderAmount ?? 0
   );
   const salesInvoiced = Number(
     row?.salesInvoiced ?? row?.sales ?? row?.salesAmount ?? row?.invoiceAmount ?? 0
   );
+  const salespersonSalesInvoiced = readSalesAmount(row);
   const poReceived = readCollectionAmount(row);
   const salespersonPoReceived = Number(
     row?.salespersonPoReceived ?? row?.poReceived ?? row?.collection ?? row?.collected ?? 0
   );
-  const salespersonSalesInvoiced = Number(row?.salespersonSalesInvoiced ?? 0);
 
   return {
     _id: rowId,
     rowId,
+    customerId: customerId || found?.customerId || "",
     customerName: name,
     newOrExisting: row?.newOrExisting === "New" ? "New" : "Existing",
-    area: String(row?.area || found?.area || "").trim(),
-    metTo: String(row?.metTo || "").trim(),
-    designation: String(row?.designation || "").trim(),
-    enquiryMode: String(row?.enquiryMode || "").trim(),
-    orderGenerated,
+    clientType: normalizeClientType(row?.clientType || row?.type || row?.newOrExisting, found?.clientType || "Existing"),
+    area: toTitleCase(row?.area || found?.area),
+    metTo: toTitleCase(row?.metTo || found?.metTo),
+    designation: toTitleCase(row?.designation || found?.designation),
+    enquiryMode: normalizeEnquiryMode(row?.enquiryMode),
+    orderGenerated: salespersonSalesInvoiced || orderGenerated,
     salesInvoiced,
     sales: salesInvoiced,
-    segment: String(row?.segment || found?.segment || "").trim(),
+    segment: toTitleCase(row?.segment || found?.segment),
     salespersonSalesInvoiced,
     salespersonPoReceived,
     poReceived,
@@ -128,7 +201,7 @@ function enrichCustomerRow(row, customerLookup) {
 }
 
 async function buildLatestCustomerVisitTemplate(userId, customerName) {
-  const name = String(customerName || "").trim();
+  const name = toTitleCase(customerName);
   if (!name) return null;
 
   const reports = await DailyCustomerReport.find({ userId })
@@ -150,6 +223,7 @@ async function buildLatestCustomerVisitTemplate(userId, customerName) {
     : {
         customerName: name,
         newOrExisting: "Existing",
+        clientType: "Existing",
         area: "",
         metTo: "",
         designation: "",
@@ -165,30 +239,47 @@ async function buildLatestCustomerVisitTemplate(userId, customerName) {
 
   return {
     ...base,
+    customerId: base.customerId || master.customerId || "",
     customerName: name,
-    area: String(base.area || master.area || "").trim(),
-    segment: String(base.segment || master.segment || "").trim(),
+    clientType: normalizeClientType(base.clientType || master.clientType || "", "Existing"),
+    area: toTitleCase(base.area || master.area),
+    metTo: toTitleCase(base.metTo || master.metTo),
+    designation: toTitleCase(base.designation || master.designation),
+    segment: toTitleCase(base.segment || master.segment),
+    orderGenerated: base.orderGenerated ?? base.salespersonSalesInvoiced ?? 0,
+    salespersonSalesInvoiced: base.salespersonSalesInvoiced ?? base.orderGenerated ?? 0,
     poReceived: base.salespersonPoReceived ?? base.poReceived ?? 0,
-    salesInvoiced: base.salespersonSalesInvoiced ?? base.salesInvoiced ?? 0,
+    salesInvoiced: 0,
   };
 }
 
-async function normalizeDailyReportRows(rows, userId, { createMissingCustomers = true, createAllCustomers = false } = {}) {
+async function normalizeDailyReportRows(
+  rows,
+  userId,
+  { createMissingCustomers = true, createAllCustomers = false, includeSalesInvoiced = true } = {}
+) {
   const safeRows = Array.isArray(rows) ? rows : [];
   const cleanedRows = safeRows
     .map((r) => {
-      const customerName = String(r?.customerName || r?.customer || r?.name || "").trim();
+      const customerName = toTitleCase(r?.customerName || r?.customer || r?.name);
+      const rowId = r?._id != null ? String(r._id).trim() : "";
+      const salesInvoicedValue = includeSalesInvoiced
+        ? Number(r?.salesInvoiced ?? r?.sales ?? r?.salesAmount ?? r?.invoiceAmount ?? 0)
+        : 0;
+      const orderGenerated = Number(r?.orderGenerated ?? r?.salespersonSalesInvoiced ?? r?.order ?? r?.orderValue ?? r?.orderAmount ?? 0);
+      const salespersonSalesInvoiced = Number(r?.salespersonSalesInvoiced ?? orderGenerated ?? salesInvoicedValue ?? 0);
       return {
+        ...(rowId ? { _id: rowId } : {}),
         customerName,
         newOrExisting: String(r?.newOrExisting || r?.type || "").trim() === "New" ? "New" : "Existing",
-        area: String(r?.area || r?.location || "").trim(),
-        metTo: String(r?.metTo || r?.met_to || "").trim(),
-        designation: String(r?.designation || r?.designationName || "").trim(),
-        enquiryMode: String(r?.enquiryMode || r?.mode || r?.modeOfEnquiry || "").trim(),
-        orderGenerated: Number(r?.orderGenerated ?? r?.order ?? r?.orderValue ?? r?.orderAmount ?? 0),
-        salesInvoiced: Number(r?.salesInvoiced ?? r?.sales ?? r?.salesAmount ?? r?.invoiceAmount ?? 0),
-        salespersonSalesInvoiced: Number(r?.salespersonSalesInvoiced ?? r?.salesInvoiced ?? r?.sales ?? r?.salesAmount ?? r?.invoiceAmount ?? 0),
-        segment: String(r?.segment || r?.segmentName || "").trim(),
+        area: toTitleCase(r?.area || r?.location),
+        metTo: toTitleCase(r?.metTo || r?.met_to),
+        designation: toTitleCase(r?.designation || r?.designationName),
+        enquiryMode: normalizeEnquiryMode(r?.enquiryMode || r?.mode || r?.modeOfEnquiry),
+        orderGenerated,
+        salesInvoiced: salesInvoicedValue,
+        salespersonSalesInvoiced,
+        segment: toTitleCase(r?.segment || r?.segmentName),
         salespersonPoReceived: Number(r?.salespersonPoReceived ?? r?.poReceived ?? r?.collection ?? r?.collected ?? 0),
         poReceived: Number(r?.poReceived ?? r?.salespersonPoReceived ?? r?.collection ?? r?.collected ?? 0),
         salesInvoiceDate: normalizeDateField(r?.salesInvoiceDate || r?.invoiceDate || r?.salesInvoicedDate),
@@ -202,22 +293,29 @@ async function normalizeDailyReportRows(rows, userId, { createMissingCustomers =
       ? cleanedRows
       : cleanedRows.filter((r) => r.newOrExisting === "New");
 
-    const newNames = rowsToCreate
-      .map((r) => ({
-        name: r.customerName,
-        area: r.area || "",
-        segment: r.segment || "",
+    for (const row of rowsToCreate) {
+      await upsertCustomerByName(Customer, {
+        name: row.customerName,
+        clientType: row.clientType || row.newOrExisting || "Existing",
+        area: row.area || "",
+        metTo: row.metTo || "",
+        designation: row.designation || "",
+        segment: row.segment || "",
+      }, {
         createdBy: userId,
-        isActive: true,
-      }));
-
-    for (const n of newNames) {
-      const exists = await Customer.findOne({ name: { $regex: `^${n.name}$`, $options: "i" } });
-      if (!exists) await Customer.create(n);
+      });
     }
   }
 
-  return cleanedRows;
+  const customerLookup = await buildCustomerLookup();
+
+  return cleanedRows.map((row) => {
+    const found = customerLookup.get(normalizeCustomerKey(row.customerName));
+    return {
+      ...row,
+      customerId: row.customerId || found?.customerId || "",
+    };
+  });
 }
 
 function rowIdentityKey(row = {}) {
@@ -243,8 +341,9 @@ function mergeSalespersonFinancials(existingRows, incomingRows) {
     const existing = existingMap.get(String(row?._id || "")) || existingMap.get(rowIdentityKey(row)) || null;
     if (!existing) return row;
 
-    const salesInvoiced = Number(row?.salesInvoiced || 0) || Number(existing?.salesInvoiced || existing?.sales || 0);
-    const salespersonSalesInvoiced = Number(row?.salespersonSalesInvoiced || row?.salesInvoiced || 0) || Number(existing?.salespersonSalesInvoiced || existing?.salesInvoiced || existing?.sales || 0);
+    const salespersonSalesInvoiced =
+      Number(row?.salespersonSalesInvoiced ?? row?.orderGenerated ?? 0) ||
+      Number(existing?.salespersonSalesInvoiced ?? existing?.orderGenerated ?? 0);
     const salespersonPoReceived =
       Number(row?.salespersonPoReceived || row?.poReceived || 0) ||
       Number(existing?.salespersonPoReceived || existing?.poReceived || existing?.collection || existing?.collected || 0);
@@ -261,10 +360,12 @@ function mergeSalespersonFinancials(existingRows, incomingRows) {
 
     return {
       ...row,
+      _id: row?._id || existing?._id,
+      orderGenerated: salespersonSalesInvoiced,
       salespersonSalesInvoiced,
       salespersonPoReceived,
-      salesInvoiced,
-      sales: salesInvoiced,
+      salesInvoiced: 0,
+      sales: 0,
       poReceived,
       salesInvoiceDate,
       collectionDate,
@@ -292,10 +393,14 @@ exports.upsertMyDailyReport = async (req, res) => {
     }
 
     const existingDoc = await DailyCustomerReport.findOne({ userId, reportDateKey }).select("rows").lean();
-    const cleanedRows = await normalizeDailyReportRows(rows, userId);
+    const cleanedRows = await normalizeDailyReportRows(rows, userId, { includeSalesInvoiced: false });
     const mergedRows = existingDoc?.rows?.length
       ? mergeSalespersonFinancials(existingDoc.rows, cleanedRows)
       : cleanedRows;
+    const duplicateRow = findDuplicateCustomerRow(mergedRows);
+    if (duplicateRow) {
+      return res.status(400).json({ message: buildDuplicateCustomerMessage(duplicateRow) });
+    }
     const snapshot = await buildSalespersonSnapshot(userId);
 
     let cleanStartLocation = null;
@@ -352,7 +457,8 @@ exports.upsertMyDailyReport = async (req, res) => {
       { new: true, upsert: true }
     );
 
-    return res.json(doc);
+    const rebuilt = await rebuildFinanceTotalsForReport(doc);
+    return res.json(rebuilt?.report || doc);
   } catch (e) {
     // duplicate key safe
     if (e.code === 11000) {
@@ -373,8 +479,8 @@ exports.getMyDailyReportByDate = async (req, res) => {
 
     const doc = await DailyCustomerReport.findOne({ userId, reportDateKey: date });
     if (doc) {
-      // For salesperson, show their own poReceived and salesInvoiced, not the total
-      doc.rows = doc.rows.map(r => ({ ...r, poReceived: r.salespersonPoReceived ?? r.poReceived ?? 0, salesInvoiced: r.salespersonSalesInvoiced ?? r.salesInvoiced ?? 0 }));
+      const entries = await getFinanceEntriesForReport(doc);
+      doc.rows = applyFinanceTotalsToRows(doc.rows, entries);
     }
     return res.json(doc || null);
   } catch (e) {
@@ -416,6 +522,11 @@ exports.adminUpdateDailyReport = async (req, res) => {
     if (!doc) {
       return res.status(404).json({ message: "Daily report not found" });
     }
+    const previousRowsById = new Map(
+      (Array.isArray(doc.rows) ? doc.rows : [])
+        .filter((row) => row && row._id)
+        .map((row) => [String(row._id), row])
+    );
 
     const cleanedRows = await normalizeDailyReportRows(rows, userId, {
       createMissingCustomers: false,
@@ -424,9 +535,33 @@ exports.adminUpdateDailyReport = async (req, res) => {
     if (!cleanedRows.length) {
       return res.status(400).json({ message: "No valid client rows found" });
     }
+    const duplicateRow = findDuplicateCustomerRow(cleanedRows);
+    if (duplicateRow) {
+      return res.status(400).json({ message: buildDuplicateCustomerMessage(duplicateRow) });
+    }
 
     doc.rows = cleanedRows;
     await doc.save();
+
+    // Keep the shared client master in sync with admin corrections.
+    for (const row of cleanedRows) {
+      const rowId = String(row?._id || "").trim();
+      const previousRow = rowId ? previousRowsById.get(rowId) : null;
+      const payload = {
+        name: row.customerName,
+        clientType: row.newOrExisting || "Existing",
+        area: row.area || "",
+        metTo: row.metTo || "",
+        designation: row.designation || "",
+        segment: row.segment || "",
+      };
+
+      if (previousRow && normalizeCustomerKey(previousRow.customerName) !== normalizeCustomerKey(row.customerName)) {
+        await upsertCustomerByPreviousName(Customer, previousRow.customerName, payload, { createdBy: req.user.id });
+      } else {
+        await upsertCustomerByName(Customer, payload, { createdBy: req.user.id });
+      }
+    }
 
     return res.json({
       message: "Daily report updated successfully",
@@ -585,12 +720,14 @@ exports.adminUpdateNewCustomerLastDate = async (req, res) => {
         if (targetArea && normalizeCustomerKey(normalizedRow.area) !== targetArea) continue;
         if (targetSegment && normalizeCustomerKey(normalizedRow.segment) !== targetSegment) continue;
 
-        const hasSales = Number(
-          normalizedRow.salesInvoiced ||
-            normalizedRow.sales ||
+        const hasSales =
+          Number(
             normalizedRow.salespersonSalesInvoiced ||
-            0
-        ) > 0;
+              normalizedRow.orderGenerated ||
+              normalizedRow.salesInvoiced ||
+              normalizedRow.sales ||
+              0
+          ) > 0;
         if (!hasSales) continue;
 
         match = {
@@ -703,6 +840,15 @@ exports.adminListDailyReportsRange = async (req, res) => {
       .populate("userId", "name email")
       .lean();
 
+    const reportIds = list.map((r) => String(r?._id || "")).filter(Boolean);
+    const financeEntries = reportIds.length
+      ? await DailyReportFinanceEntry.find({ dailyReportId: { $in: reportIds } })
+          .sort({ entryDate: 1, createdAt: 1 })
+          .select("dailyReportId rowId type amount entryDate createdAt")
+          .lean()
+      : [];
+    const financeByReport = indexFinanceEntriesByReport(financeEntries);
+
     // Totals for summary
     let totalNetKm = 0;
     let totalOrder = 0;
@@ -716,7 +862,9 @@ exports.adminListDailyReportsRange = async (req, res) => {
       const netKm = closing - opening;
 
       const rows = Array.isArray(r.rows) ? r.rows : [];
-      const enrichedRows = rows.map((x) => enrichCustomerRow(x, customerLookup));
+      const financeRows = financeByReport.get(String(r._id || "")) || [];
+      const currentRows = applyFinanceTotalsToRows(rows, financeRows);
+      const enrichedRows = currentRows.map((x) => enrichCustomerRow(x, customerLookup));
       const orderSum = enrichedRows.reduce((a, x) => a + Number(x.orderGenerated || 0), 0);
     const salesInvoicedSum = enrichedRows.reduce((a, x) => a + Number(x.salesInvoiced || x.sales || 0), 0);
       const poSum = enrichedRows.reduce((a, x) => a + readCollectionAmount(x), 0);
@@ -819,6 +967,15 @@ exports.adminExportDailyReportsCSV = async (req, res) => {
       .limit(2000)
       .lean();
 
+    const reportIds = list.map((r) => String(r?._id || "")).filter(Boolean);
+    const financeEntries = reportIds.length
+      ? await DailyReportFinanceEntry.find({ dailyReportId: { $in: reportIds } })
+          .sort({ entryDate: 1, createdAt: 1 })
+          .select("dailyReportId rowId type amount entryDate createdAt")
+          .lean()
+      : [];
+    const financeByReport = indexFinanceEntriesByReport(financeEntries);
+
     // CSV header
     const header = [
       "reportDate",
@@ -858,7 +1015,9 @@ exports.adminExportDailyReportsCSV = async (req, res) => {
         ? new Date(r.startLocation.capturedAt).toISOString()
         : "";
       const trackPoints = Array.isArray(r?.locationTrail) ? r.locationTrail.length : 0;
-      const items = (Array.isArray(r.rows) ? r.rows : []).map((it) => enrichCustomerRow(it, customerLookup));
+      const financeRows = financeByReport.get(String(r._id || "")) || [];
+      const currentRows = applyFinanceTotalsToRows(Array.isArray(r.rows) ? r.rows : [], financeRows);
+      const items = currentRows.map((it) => enrichCustomerRow(it, customerLookup));
 
       if (!items.length) {
         // still output one line per report

@@ -9,6 +9,7 @@ const User = require("../models/User");
 const Segment = require("../models/Segment");
 const { getRange } = require("../utils/period");
 const { resolveTargetRows } = require("../utils/targetRollup");
+const { buildCustomerLookupMap, buildCustomerSelectFields } = require("../utils/customerMaster");
 
 function normalizeKey(value) {
   return String(value || "").trim().toLowerCase();
@@ -37,12 +38,14 @@ function pad2(n) {
 
 function monthKeyToQuarterKey(monthKey) {
   const { year, month } = parseMonthKey(monthKey);
-  const quarter = Math.floor((month - 1) / 3) + 1;
-  return `${year}-Q${quarter}`;
+  const fiscalYear = month >= 4 ? year : year - 1;
+  const quarter = month >= 4 && month <= 6 ? 1 : month <= 9 ? 2 : month <= 12 ? 3 : 4;
+  return `${fiscalYear}-Q${quarter}`;
 }
 
 function monthKeyToYearKey(monthKey) {
-  return String(monthKey || "").slice(0, 4);
+  const { year, month } = parseMonthKey(monthKey);
+  return String(month >= 4 ? year : year - 1);
 }
 
 function monthKeysInRange(fromKey, toKey) {
@@ -120,19 +123,8 @@ function buildSegmentColumns(segmentDocs, ...maps) {
 }
 
 async function buildCustomerLookup() {
-  const customers = await Customer.find({}).select("name area segment").lean();
-  const map = new Map();
-
-  for (const customer of customers) {
-    const key = String(customer?.name || "").trim().toLowerCase();
-    if (!key || map.has(key)) continue;
-    map.set(key, {
-      area: String(customer?.area || "").trim(),
-      segment: String(customer?.segment || "").trim(),
-    });
-  }
-
-  return map;
+  const customers = await Customer.find({}).select(buildCustomerSelectFields()).lean();
+  return buildCustomerLookupMap(customers);
 }
 
 function enrichCustomerRow(row, customerLookup) {
@@ -155,9 +147,10 @@ function enrichCustomerRow(row, customerLookup) {
     rowId,
     customerName: name,
     newOrExisting: row?.newOrExisting === "New" ? "New" : "Existing",
+    clientType: String(row?.clientType || row?.type || row?.newOrExisting || found?.clientType || "Existing").trim() || "Existing",
     area: String(row?.area || found?.area || "").trim(),
-    metTo: String(row?.metTo || "").trim(),
-    designation: String(row?.designation || "").trim(),
+    metTo: String(row?.metTo || found?.metTo || "").trim(),
+    designation: String(row?.designation || found?.designation || "").trim(),
     enquiryMode: String(row?.enquiryMode || "").trim(),
     orderGenerated,
     salesInvoiced,
@@ -844,7 +837,13 @@ exports.adminPerformanceReport = async (req, res) => {
           },
           salesInvoiced: {
             $sum: {
-              $map: { input: { $ifNull: ["$rows", []] }, as: "r", in: { $ifNull: ["$$r.salesInvoiced", 0] } }
+              $map: {
+                input: { $ifNull: ["$rows", []] },
+                as: "r",
+                in: {
+                  $ifNull: ["$$r.salesInvoiced", 0],
+                },
+              }
             }
           },
           collection: {
@@ -959,25 +958,26 @@ exports.adminCustomerWiseReport = async (req, res) => {
     const { userId, periodType = "MONTH", periodKey, segment, view } = req.query;
     const reportView = String(view || "clients").trim().toLowerCase();
     const isNewCustomerView = ["new", "tracking", "newcustomer", "new-customer"].includes(reportView);
+    const selectedUserId = String(userId || "").trim();
+    const hasUserFilter = Boolean(selectedUserId);
 
-    if (!userId) return res.status(400).json({ message: "userId required" });
     if (!periodKey) return res.status(400).json({ message: "periodKey required" });
+    if (hasUserFilter && !mongoose.Types.ObjectId.isValid(selectedUserId)) {
+      return res.status(400).json({ message: "Invalid userId" });
+    }
 
     const { from, to } = getRange(periodType, periodKey);
     const customerLookup = await buildCustomerLookup();
 
     const match = {
-      userId: new mongoose.Types.ObjectId(userId),
       reportDateKey: { $gte: from, $lte: to },
     };
+    if (hasUserFilter) match.userId = new mongoose.Types.ObjectId(selectedUserId);
 
     const periodDocs = await DailyCustomerReport.find(match).select("_id rows").lean();
-    const historyDocs = await DailyCustomerReport.find({
-      userId: new mongoose.Types.ObjectId(userId),
-      reportDateKey: { $lte: to },
-    })
-      .select("_id rows reportDateKey")
-      .lean();
+    const historyQuery = { reportDateKey: { $lte: to } };
+    if (hasUserFilter) historyQuery.userId = new mongoose.Types.ObjectId(selectedUserId);
+    const historyDocs = await DailyCustomerReport.find(historyQuery).select("_id rows reportDateKey").lean();
 
     const rowContextMap = new Map();
     const customerMap = new Map();
@@ -1032,8 +1032,8 @@ exports.adminCustomerWiseReport = async (req, res) => {
           collectionDate: normalizedRow.collectionDate,
           orderGenerated: Number(normalizedRow.orderGenerated || 0),
           reportKey: financeRowKey,
-          baseSalesInvoiced: Number(normalizedRow.salespersonSalesInvoiced || 0),
-          fallbackSalesInvoiced: Number(normalizedRow.salesInvoiced || normalizedRow.sales || 0),
+          baseSalesInvoiced: Number(normalizedRow.salesInvoiced || 0),
+          fallbackSalesInvoiced: Number(normalizedRow.salesInvoiced || 0),
           baseCollection: Number(normalizedRow.salespersonPoReceived || 0),
           fallbackCollection: Number(normalizedRow.poReceived || normalizedRow.collection || 0),
         });
@@ -1041,11 +1041,12 @@ exports.adminCustomerWiseReport = async (req, res) => {
     }
 
     const financeMatch = {
-      userId: new mongoose.Types.ObjectId(userId),
       entryDate: { $gte: from, $lte: to },
     };
+    if (hasUserFilter) financeMatch.userId = new mongoose.Types.ObjectId(selectedUserId);
     const financeEntries = await DailyReportFinanceEntry.find(financeMatch)
-      .select("dailyReportId rowId type amount")
+      .sort({ entryDate: 1, createdAt: 1 })
+      .select("dailyReportId rowId type amount entryDate createdAt")
       .lean();
 
     const periodReportIds = new Set(periodDocs.map((doc) => String(doc?._id || "")));
@@ -1096,13 +1097,10 @@ exports.adminCustomerWiseReport = async (req, res) => {
       const finance = financeByRow.get(ctx.reportKey);
       const adminSales = Number(finance?.salesInvoiced || 0);
       const adminCollection = Number(finance?.collection || 0);
-      const salespersonSales = Number(ctx.baseSalesInvoiced || 0);
-      const storedSales = Number(ctx.fallbackSalesInvoiced || 0);
       const salespersonCollection = Number(ctx.baseCollection || 0);
       const storedCollection = Number(ctx.fallbackCollection || 0);
 
-      const salesTotal =
-        salespersonSales > 0 || adminSales > 0 ? salespersonSales + adminSales : storedSales;
+      const salesTotal = adminSales;
       const collectionTotal =
         salespersonCollection > 0 || adminCollection > 0
           ? salespersonCollection + adminCollection
@@ -1176,8 +1174,9 @@ exports.adminCustomerWiseReport = async (req, res) => {
             item.area = item.area || normalizedRow.area;
             item.segment = item.segment || normalizedRow.segment;
             item.orderGenerated += Number(normalizedRow.orderGenerated || 0);
-            item.salesInvoiced += Number(normalizedRow.salesInvoiced || normalizedRow.sales || 0);
-            item.sales += Number(normalizedRow.salesInvoiced || normalizedRow.sales || 0);
+            const salesActual = Number(normalizedRow.salesInvoiced || 0);
+            item.salesInvoiced += salesActual;
+            item.sales += salesActual;
             item.collection += Number(normalizedRow.poReceived || normalizedRow.salespersonPoReceived || 0);
             item.visits += 1;
 
@@ -1496,7 +1495,9 @@ exports.myCustomerCollectionTracker = async (req, res) => {
           customerName: { $trim: { input: { $ifNull: ["$rows.customerName", ""] } } },
           area: { $trim: { input: { $ifNull: ["$rows.area", ""] } } },
           orderGenerated: { $ifNull: ["$rows.orderGenerated", 0] },
-          salesInvoiced: { $ifNull: ["$rows.salesInvoiced", 0] },
+          salesInvoiced: {
+            $ifNull: ["$rows.salesInvoiced", 0],
+          },
           collection: {
             $ifNull: [
               "$rows.poReceived",

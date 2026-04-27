@@ -9,8 +9,10 @@ const c = require("../controllers/customerController");
 
 // sales + admin both can search
 router.get("/search", auth, requireRole("admin", "sales"), c.searchCustomers);
+router.get("/", auth, requireRole("admin", "sales"), c.listCustomers);
 
-// optional: allow sales to add customer (for NEW entries) or admin only if you want strict
-router.post("/", auth, requireRole("admin", "sales"), c.createCustomer);
+// admin maintains the shared customer master
+router.post("/", auth, requireRole("admin"), c.createCustomer);
+router.put("/:id", auth, requireRole("admin"), c.updateCustomer);
 
 module.exports = router;

@@ -38,10 +38,10 @@ const upsertTargetSchema = z.object({
   segmentId: z.string().min(10),
   periodType: z.enum(["MONTH", "QUARTER", "YEAR"]),
   periodKey: z.string().min(3),
-  vendorVisitTarget: z.number().optional(),
-  newVendorTarget: z.number().optional(),
-  salesTarget: z.number().optional(),
-  collectionTarget: z.number().optional()
+  vendorVisitTarget: z.number().finite().nonnegative().optional(),
+  newVendorTarget: z.number().finite().nonnegative().optional(),
+  salesTarget: z.number().finite().nonnegative().optional(),
+  collectionTarget: z.number().finite().nonnegative().optional()
 });
 
 module.exports = {

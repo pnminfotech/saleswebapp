@@ -76,6 +76,22 @@ async function upsertTarget(req, res) {
   }
   await doc.save();
 
+  if (d.periodType === "MONTH") {
+    await Target.updateMany(
+      {
+        userId: d.userId,
+        periodType: "MONTH",
+        periodKey: d.periodKey,
+      },
+      {
+        $set: {
+          vendorVisitTarget: d.vendorVisitTarget ?? 0,
+          newVendorTarget: d.newVendorTarget ?? 0,
+        },
+      }
+    );
+  }
+
   res.json(doc);
 }
 
@@ -135,8 +151,9 @@ async function getOneTargetForAdmin(req, res) {
       return res.status(400).json({ message: "userId, segmentId, periodType, periodKey are required" });
     }
 
-    const t = await Target.findOne({ userId, segmentId, periodType, periodKey });
-    return res.json(t || null);
+    const rows = await resolveTargetRows({ periodType, periodKey, userId });
+    const target = rows.find((row) => matchesSegmentFilter(row, segmentId)) || null;
+    return res.json(target);
   } catch (e) {
     return res.status(500).json({ message: e.message });
   }
@@ -144,6 +161,12 @@ async function getOneTargetForAdmin(req, res) {
 async function listTargetsForAdmin(req, res) {
   try {
     const { userId, segmentId, periodType, periodKey } = req.query;
+
+    if (periodType && periodKey) {
+      const rows = await resolveTargetRows({ periodType, periodKey, userId });
+      const items = rows.filter((row) => matchesSegmentFilter(row, segmentId));
+      return res.json(items);
+    }
 
     const q = {};
     if (userId) q.userId = userId;

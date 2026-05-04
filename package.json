@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
-    "migrate:legacy-quarter-targets": "node scripts/migrateLegacyQuarterTargets.js"
+    "migrate:legacy-quarter-targets": "node scripts/migrateLegacyQuarterTargets.js",
+    "seed:admin": "node src/seed/createAdmin.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

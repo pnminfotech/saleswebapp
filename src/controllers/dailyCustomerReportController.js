@@ -506,7 +506,7 @@ exports.getMyCustomerVisitTemplate = async (req, res) => {
 
 exports.adminUpdateDailyReport = async (req, res) => {
   try {
-    const { reportDateKey, userId, rows } = req.body;
+    const { reportDateKey, userId, rows, rowId, changes } = req.body;
 
     if (!isValidDateKey(reportDateKey)) {
       return res.status(400).json({ message: "reportDateKey must be YYYY-MM-DD" });
@@ -514,7 +514,7 @@ exports.adminUpdateDailyReport = async (req, res) => {
     if (!userId) {
       return res.status(400).json({ message: "userId required" });
     }
-    if (!Array.isArray(rows) || !rows.length) {
+    if ((!Array.isArray(rows) || !rows.length) && !(String(rowId || "").trim() && changes && typeof changes === "object")) {
       return res.status(400).json({ message: "rows required" });
     }
 
@@ -528,9 +528,71 @@ exports.adminUpdateDailyReport = async (req, res) => {
         .map((row) => [String(row._id), row])
     );
 
-    const cleanedRows = await normalizeDailyReportRows(rows, userId, {
+    let cleanedRows = [];
+
+    if (String(rowId || "").trim() && changes && typeof changes === "object") {
+      const targetRowId = String(rowId).trim();
+      const existingIndex = Array.isArray(doc.rows)
+        ? doc.rows.findIndex((row) => String(row?._id || "").trim() === targetRowId)
+        : -1;
+
+      if (existingIndex < 0) {
+        return res.status(404).json({ message: "Client row not found in report" });
+      }
+
+      const existingRow = doc.rows[existingIndex]?.toObject ? doc.rows[existingIndex].toObject() : { ...(doc.rows[existingIndex] || {}) };
+      const mergedPayload = {
+        ...existingRow,
+        ...changes,
+        _id: existingRow._id || targetRowId,
+      };
+
+      cleanedRows = await normalizeDailyReportRows([mergedPayload], userId, {
+        createMissingCustomers: false,
+        createAllCustomers: false,
+        includeSalesInvoiced: true,
+      });
+
+      if (!cleanedRows.length) {
+        return res.status(400).json({ message: "No valid client row found" });
+      }
+
+      const mergedRow = cleanedRows[0];
+      const nextRows = (Array.isArray(doc.rows) ? doc.rows : []).map((row, index) => (index === existingIndex ? mergedRow : row));
+      const duplicateRow = findDuplicateCustomerRow(nextRows);
+      if (duplicateRow) {
+        return res.status(400).json({ message: buildDuplicateCustomerMessage(duplicateRow) });
+      }
+
+      doc.rows = nextRows;
+      await doc.save();
+
+      const previousRow = previousRowsById.get(targetRowId) || existingRow;
+      const payload = {
+        name: mergedRow.customerName,
+        clientType: mergedRow.newOrExisting || "Existing",
+        area: mergedRow.area || "",
+        metTo: mergedRow.metTo || "",
+        designation: mergedRow.designation || "",
+        segment: mergedRow.segment || "",
+      };
+
+      if (previousRow && normalizeCustomerKey(previousRow.customerName) !== normalizeCustomerKey(mergedRow.customerName)) {
+        await upsertCustomerByPreviousName(Customer, previousRow.customerName, payload, { createdBy: req.user.id });
+      } else {
+        await upsertCustomerByName(Customer, payload, { createdBy: req.user.id });
+      }
+
+      return res.json({
+        message: "Daily report updated successfully",
+        report: doc,
+      });
+    }
+
+    cleanedRows = await normalizeDailyReportRows(rows, userId, {
       createMissingCustomers: false,
       createAllCustomers: false,
+      includeSalesInvoiced: true,
     });
     if (!cleanedRows.length) {
       return res.status(400).json({ message: "No valid client rows found" });

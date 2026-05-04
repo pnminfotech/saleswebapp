@@ -44,6 +44,26 @@ const upsertTargetSchema = z.object({
   collectionTarget: z.number().finite().nonnegative().optional()
 });
 
+const targetSheetAssignmentSchema = z.object({
+  salespersonName: z.string().min(1),
+  segmentName: z.string().min(1),
+  monthKey: z.string().regex(/^\d{4}-\d{2}$/),
+  vendorVisitTarget: z.number().finite().nonnegative().optional(),
+  newVendorTarget: z.number().finite().nonnegative().optional(),
+  salesTarget: z.number().finite().nonnegative().optional(),
+  collectionTarget: z.number().finite().nonnegative().optional(),
+});
+
+const targetSheetImportSchema = z.object({
+  yearKey: z.string().min(2),
+  fileName: z.string().min(1),
+  sheetName: z.string().min(1),
+  salespersonNames: z.array(z.string().min(1)).default([]),
+  segmentNames: z.array(z.string().min(1)).default([]),
+  matrix: z.array(z.array(z.any())).min(1),
+  assignments: z.array(targetSheetAssignmentSchema).default([]),
+});
+
 module.exports = {
   loginSchema,
   forceChangeSchema,
@@ -51,5 +71,7 @@ module.exports = {
   adminResetPasswordSchema,
   createSalesSchema,
   updateSalesSchema,
-  upsertTargetSchema
+  upsertTargetSchema,
+  targetSheetAssignmentSchema,
+  targetSheetImportSchema,
 };

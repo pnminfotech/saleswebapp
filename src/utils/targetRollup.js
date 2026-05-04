@@ -53,25 +53,51 @@ function quarterKeysForYearKey(yearKey) {
   return [`${year}-Q1`, `${year}-Q2`, `${year}-Q3`, `${year}-Q4`];
 }
 
+function getYearKeyFromQuarterKey(quarterKey) {
+  const raw = String(quarterKey || "").trim().toUpperCase();
+  const fy = raw.match(/^(?:FY\s*)?(\d{4})-Q[1-4]$/);
+  const cy = raw.match(/^CY\s*(\d{4})-Q[1-4]$/);
+  return fy ? fy[1] : cy ? cy[1] : raw.split("-Q")[0];
+}
+
 function makeTargetKey(doc) {
   return `${String(doc?.userId || "").trim()}|${String(doc?.segmentId || "").trim()}`;
 }
 
-function pushDoc(map, doc, sourceOverride) {
+function buildRowId(doc, options = {}) {
+  if (doc?._id && !options.syntheticIdPrefix) {
+    return String(doc._id);
+  }
+
+  const periodType = String(options.periodTypeOverride || doc?.periodType || "").trim().toUpperCase();
+  const periodKey = String(options.periodKeyOverride || doc?.periodKey || "").trim();
+  const key = makeTargetKey(doc);
+  const prefix = String(options.syntheticIdPrefix || "derived").trim() || "derived";
+  return `${prefix}:${periodType}:${periodKey}:${key}`;
+}
+
+function pushDoc(map, doc, options = {}) {
   const key = makeTargetKey(doc);
   if (!key || key === "|") return;
 
+  const periodType = String(options.periodTypeOverride || doc?.periodType || "").trim().toUpperCase();
+  const periodKey = String(options.periodKeyOverride || doc?.periodKey || "").trim();
+  const source = options.sourceOverride || String(doc?.source || "MANUAL").trim() || "MANUAL";
+  const isDerived = Boolean(options.derived || source === "AUTO");
+
   const existing = map.get(key) || {
+    _id: buildRowId(doc, options),
     userId: String(doc?.userId || "").trim(),
     segmentId: String(doc?.segmentId || "").trim(),
-    periodType: String(doc?.periodType || "").trim(),
-    periodKey: String(doc?.periodKey || "").trim(),
+    periodType,
+    periodKey,
     vendorVisitTarget: 0,
     newVendorTarget: 0,
     salesTarget: 0,
     collectionTarget: 0,
-    source: sourceOverride || String(doc?.source || "MANUAL").trim() || "MANUAL",
+    source,
     parentKey: String(doc?.parentKey || "").trim(),
+    derived: isDerived,
   };
 
   existing.vendorVisitTarget += Number(doc?.vendorVisitTarget || 0);
@@ -79,8 +105,24 @@ function pushDoc(map, doc, sourceOverride) {
   existing.salesTarget += Number(doc?.salesTarget || 0);
   existing.collectionTarget += Number(doc?.collectionTarget || 0);
 
-  if (sourceOverride) {
-    existing.source = sourceOverride;
+  if (options.syntheticIdPrefix || options.derived) {
+    existing._id = buildRowId(doc, options);
+    existing.derived = true;
+  }
+
+  if (periodType) {
+    existing.periodType = periodType;
+  }
+  if (periodKey) {
+    existing.periodKey = periodKey;
+  }
+
+  if (options.parentKeyOverride !== undefined) {
+    existing.parentKey = String(options.parentKeyOverride || "").trim();
+  }
+
+  if (source) {
+    existing.source = source;
   } else if (!existing.source) {
     existing.source = String(doc?.source || "MANUAL").trim() || "MANUAL";
   }
@@ -106,62 +148,70 @@ async function resolveTargetRows({ periodType, periodKey, userId }) {
   }
 
   const exactDocs = await fetchTargetDocs(baseFilter);
-  const finalMap = new Map();
+  let rows = [];
 
-  for (const doc of exactDocs) {
-    pushDoc(finalMap, doc);
-  }
-
-  if (pt === "QUARTER" || pt === "YEAR") {
+  if (pt === "MONTH") {
+    const finalMap = new Map();
+    for (const doc of exactDocs) {
+      pushDoc(finalMap, doc);
+    }
+    rows = Array.from(finalMap.values());
+  } else {
     const { from, to } = getRange(pt, pk);
     const monthKeys = monthKeysInRange(from, to);
+    const monthFilter = {
+      periodType: "MONTH",
+      periodKey: { $in: monthKeys },
+    };
+    if (userId) monthFilter.userId = toObjectId(userId);
 
-    if (pt === "YEAR") {
+    const monthDocs = await fetchTargetDocs(monthFilter);
+
+    if (monthDocs.length) {
+      const derivedMap = new Map();
+      for (const doc of monthDocs) {
+        pushDoc(derivedMap, doc, {
+          sourceOverride: "AUTO",
+          periodTypeOverride: pt,
+          periodKeyOverride: pk,
+          parentKeyOverride: pt === "QUARTER" ? getYearKeyFromQuarterKey(pk) : "",
+          derived: true,
+          syntheticIdPrefix: "derived",
+        });
+      }
+      rows = Array.from(derivedMap.values());
+    } else if (exactDocs.length) {
+      const exactMap = new Map();
+      for (const doc of exactDocs) {
+        pushDoc(exactMap, doc);
+      }
+      rows = Array.from(exactMap.values());
+    } else if (pt === "YEAR") {
       const quarterKeys = quarterKeysForYearKey(pk);
       const quarterFilter = {
         periodType: "QUARTER",
         periodKey: { $in: quarterKeys },
       };
-      const monthFilter = {
-        periodType: "MONTH",
-        periodKey: { $in: monthKeys },
-      };
-      if (userId) {
-        quarterFilter.userId = toObjectId(userId);
-        monthFilter.userId = toObjectId(userId);
-      }
+      if (userId) quarterFilter.userId = toObjectId(userId);
 
-      const [quarterDocs, monthDocs] = await Promise.all([fetchTargetDocs(quarterFilter), fetchTargetDocs(monthFilter)]);
-
-      const fallbackMap = new Map();
-      for (const doc of quarterDocs) pushDoc(fallbackMap, doc, "AUTO");
-      for (const doc of monthDocs) {
-        const key = makeTargetKey(doc);
-        if (fallbackMap.has(key)) continue;
-        pushDoc(fallbackMap, doc, "AUTO");
-      }
-
-      for (const [key, row] of fallbackMap.entries()) {
-        if (!finalMap.has(key)) finalMap.set(key, row);
-      }
-    } else {
-      const monthFilter = {
-        periodType: "MONTH",
-        periodKey: { $in: monthKeys },
-      };
-      if (userId) monthFilter.userId = toObjectId(userId);
-
-      const monthDocs = await fetchTargetDocs(monthFilter);
-      const fallbackMap = new Map();
-      for (const doc of monthDocs) pushDoc(fallbackMap, doc, "AUTO");
-
-      for (const [key, row] of fallbackMap.entries()) {
-        if (!finalMap.has(key)) finalMap.set(key, row);
+      const quarterDocs = await fetchTargetDocs(quarterFilter);
+      if (quarterDocs.length) {
+        const derivedMap = new Map();
+        for (const doc of quarterDocs) {
+          pushDoc(derivedMap, doc, {
+            sourceOverride: "AUTO",
+            periodTypeOverride: pt,
+            periodKeyOverride: pk,
+            parentKeyOverride: "",
+            derived: true,
+            syntheticIdPrefix: "derived",
+          });
+        }
+        rows = Array.from(derivedMap.values());
       }
     }
   }
 
-  const rows = Array.from(finalMap.values());
   if (!rows.length) return [];
 
   const userIds = Array.from(
@@ -197,10 +247,21 @@ async function resolveTargetRows({ periodType, periodKey, userId }) {
 }
 
 function summarizeTargetRows(rows) {
+  const seenSalespersonPeriods = new Set();
   return (Array.isArray(rows) ? rows : []).reduce(
     (acc, row) => {
-      acc.vendorVisitTarget += Number(row?.vendorVisitTarget || 0);
-      acc.newVendorTarget += Number(row?.newVendorTarget || 0);
+      const vendorKey = [
+        String(row?.userId?._id || row?.userId || "").trim(),
+        String(row?.periodType || "").trim().toUpperCase(),
+        String(row?.periodKey || "").trim(),
+      ].join("|");
+
+      if (!seenSalespersonPeriods.has(vendorKey)) {
+        seenSalespersonPeriods.add(vendorKey);
+        acc.vendorVisitTarget += Number(row?.vendorVisitTarget || 0);
+        acc.newVendorTarget += Number(row?.newVendorTarget || 0);
+      }
+
       acc.salesTarget += Number(row?.salesTarget || 0);
       acc.collectionTarget += Number(row?.collectionTarget || 0);
       return acc;

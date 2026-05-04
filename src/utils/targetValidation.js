@@ -45,7 +45,25 @@ function addTotals(target, source) {
 }
 
 function totalsFromDocs(docs) {
-  return (Array.isArray(docs) ? docs : []).reduce((acc, doc) => addTotals(acc, doc), emptyTotals());
+  const seenSalespersonPeriods = new Set();
+
+  return (Array.isArray(docs) ? docs : []).reduce((acc, doc) => {
+    const periodType = String(doc?.periodType || "").trim().toUpperCase();
+    const periodKey = String(doc?.periodKey || "").trim();
+    const userKey = String(doc?.userId || "").trim();
+    const vendorKey = `${userKey}|${periodType}|${periodKey}`;
+
+    acc.salesTarget += num(doc?.salesTarget);
+    acc.collectionTarget += num(doc?.collectionTarget);
+
+    if (!seenSalespersonPeriods.has(vendorKey)) {
+      seenSalespersonPeriods.add(vendorKey);
+      acc.vendorVisitTarget += num(doc?.vendorVisitTarget);
+      acc.newVendorTarget += num(doc?.newVendorTarget);
+    }
+
+    return acc;
+  }, emptyTotals());
 }
 
 function subtractTotals(left, right) {
@@ -213,6 +231,16 @@ async function validateTargetWrite({ userId, segmentId, periodType, periodKey, v
   const errors = [];
   const periodLabel = pt === "MONTH" ? "Monthly" : pt === "QUARTER" ? "Quarterly" : "Annual";
 
+  if (pt !== "MONTH") {
+    return {
+      ok: false,
+      errors: [
+        `${periodLabel} targets are derived automatically from monthly targets. Please assign monthly targets only.`,
+      ],
+      context,
+    };
+  }
+
   for (const field of TARGET_FIELDS) {
     if (candidate[field] < 0) {
       errors.push(`${periodLabel} ${field} cannot be negative.`);
@@ -221,63 +249,6 @@ async function validateTargetWrite({ userId, segmentId, periodType, periodKey, v
 
   if (errors.length) {
     return { ok: false, errors, context };
-  }
-
-  if (pt === "MONTH") {
-    const quarterCap = context.parentQuarterTarget;
-    const yearCap = context.parentYearTarget;
-    const quarterAfterSave = addTotals({ ...context.quarterUsage }, candidate);
-    const yearAfterSave = addTotals({ ...context.yearUsage }, candidate);
-
-    for (const field of TARGET_FIELDS) {
-      if (quarterCap && num(quarterAfterSave[field]) > num(quarterCap[field])) {
-        errors.push(buildConstraintError("Quarter", field, quarterCap[field], context.quarterUsage[field], candidate[field]));
-      }
-      if (yearCap && num(yearAfterSave[field]) > num(yearCap[field])) {
-        errors.push(buildConstraintError("Annual", field, yearCap[field], context.yearUsage[field], candidate[field]));
-      }
-    }
-  }
-
-  if (pt === "QUARTER") {
-    const yearCap = context.parentYearTarget;
-    for (const field of TARGET_FIELDS) {
-      if (num(candidate[field]) < num(context.quarterUsage[field])) {
-        errors.push(
-          `${periodLabel} ${field} must be at least the already assigned monthly total of ${num(context.quarterUsage[field]).toLocaleString("en-IN")} for ${context.selection.quarterKey}.`
-        );
-      }
-      if (yearCap && num(candidate[field]) > num(yearCap[field])) {
-        errors.push(
-          `${periodLabel} ${field} cannot be greater than the annual limit of ${num(yearCap[field]).toLocaleString("en-IN")} for ${context.selection.yearKey}.`
-        );
-      }
-    }
-  }
-
-  if (pt === "YEAR") {
-    const maxQuarterCaps = context.yearQuarterCaps.reduce(
-      (acc, doc) => {
-        for (const field of TARGET_FIELDS) {
-          acc[field] = Math.max(acc[field], num(doc[field]));
-        }
-        return acc;
-      },
-      emptyTotals()
-    );
-
-    for (const field of TARGET_FIELDS) {
-      if (num(candidate[field]) < num(context.yearUsage[field])) {
-        errors.push(
-          `${periodLabel} ${field} must be at least the already assigned monthly total of ${num(context.yearUsage[field]).toLocaleString("en-IN")} for ${context.selection.yearKey}.`
-        );
-      }
-      if (num(candidate[field]) < num(maxQuarterCaps[field])) {
-        errors.push(
-          `${periodLabel} ${field} must also stay above the largest quarter target (${num(maxQuarterCaps[field]).toLocaleString("en-IN")}) inside ${context.selection.yearKey}.`
-        );
-      }
-    }
   }
 
   return {
